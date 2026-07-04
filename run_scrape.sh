@@ -1,7 +1,7 @@
 #!/bin/zsh
 # Full automatic scrape: news + jobs + products for every company,
 # then rebuild the country/city mappings. Run by launchd (see
-# ~/Library/LaunchAgents/com.companyintel.scraper.plist) every 6 hours.
+# ~/Library/LaunchAgents/com.companyintel.scraper.plist) every hour.
 set -e
 cd /Users/mohitchack/Desktop/Work/code/web-scraper
 
