@@ -68,6 +68,9 @@ CREATE INDEX IF NOT EXISTS products_company_idx ON products (company);
 ALTER TABLE news      ADD COLUMN IF NOT EXISTS source_url TEXT;
 ALTER TABLE products  ADD COLUMN IF NOT EXISTS image      TEXT;
 ALTER TABLE companies ADD COLUMN IF NOT EXISTS image      TEXT;
+ALTER TABLE news      ADD COLUMN IF NOT EXISTS topic TEXT
+                      NOT NULL DEFAULT 'general';
+CREATE INDEX IF NOT EXISTS news_topic_idx ON news (topic);
 """
 
 

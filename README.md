@@ -12,9 +12,10 @@ Two scrapers in one repo:
 The fastest way to run on any machine with Docker installed.
 
 ```bash
-git clone <repo-url> && cd web-scraper
+git clone <repo-url> && cd company-intel-scraper
 cp .env.example .env          # fill in DATABASE_URL
-docker compose up --build     # starts Postgres + scraper
+docker build -t company-scraper .
+docker run --rm --env-file .env company-scraper
 ```
 
 That's it. See [Docker](#docker) for full details.
@@ -64,8 +65,8 @@ All following commands run as this user.
 ### Step 3 — Clone the repo
 
 ```bash
-git clone <repo-url> /home/scraper/web-scraper
-cd /home/scraper/web-scraper
+git clone <repo-url> /home/scraper/company-intel-scraper
+cd /home/scraper/company-intel-scraper
 ```
 
 ---
@@ -133,7 +134,6 @@ mkdir -p logs
 ### Step 8 — Run once to verify
 
 ```bash
-set -a && source .env && set +a
 ./.venv/bin/python company_scraper.py --only news
 ```
 
@@ -170,7 +170,7 @@ crontab -e
 Add:
 
 ```
-0 * * * * cd /home/scraper/web-scraper && set -a && source .env && set +a && bash run_scrape.sh >> logs/scrape.log 2>&1
+0 * * * * bash /home/scraper/company-intel-scraper/run_scrape.sh >> /home/scraper/company-intel-scraper/logs/scrape.log 2>&1
 ```
 
 Verify cron picked it up:
@@ -188,7 +188,7 @@ grep CRON /var/log/cron         # RHEL/Amazon Linux
 Create `/etc/logrotate.d/company-scraper`:
 
 ```
-/home/scraper/web-scraper/logs/scrape.log {
+/home/scraper/company-intel-scraper/logs/*.log {
     daily
     rotate 7
     compress
@@ -202,7 +202,7 @@ Create `/etc/logrotate.d/company-scraper`:
 ### Updating the code
 
 ```bash
-cd /home/scraper/web-scraper
+cd /home/scraper/company-intel-scraper
 git pull
 ./.venv/bin/pip install -r requirements.txt   # pick up any new deps
 ```
@@ -215,57 +215,26 @@ The next cron run will use the updated code automatically.
 
 ### Prerequisites
 
-- [Docker](https://docs.docker.com/get-docker/) + Docker Compose v2
+- [Docker](https://docs.docker.com/get-docker/)
 
-### Build and run (one-shot)
+### Build
 
 ```bash
-cp .env.example .env   # fill in DATABASE_URL pointing to your Postgres
 docker build -t company-scraper .
+```
+
+### Run (one-shot scrape)
+
+```bash
+cp .env.example .env   # fill in DATABASE_URL
 docker run --rm --env-file .env company-scraper
 ```
 
-### Compose (scraper + Postgres together)
-
-```bash
-docker compose up --build
-```
-
-`docker-compose.yml`:
-
-```yaml
-services:
-  db:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_DB: company_intel
-      POSTGRES_USER: scraper
-      POSTGRES_PASSWORD: secret
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U scraper -d company_intel"]
-      interval: 5s
-      retries: 5
-
-  scraper:
-    build: .
-    env_file: .env
-    environment:
-      DATABASE_URL: postgresql://scraper:secret@db:5432/company_intel
-    depends_on:
-      db:
-        condition: service_healthy
-
-volumes:
-  pgdata:
-```
-
-### Scheduled runs via Docker + cron
+### Scheduled runs via cron
 
 ```bash
 # crontab -e — run every hour
-0 * * * * docker run --rm --env-file /opt/web-scraper/.env company-scraper >> /var/log/company-scraper.log 2>&1
+0 * * * * docker run --rm --env-file /home/scraper/company-intel-scraper/.env company-scraper >> /var/log/company-scraper.log 2>&1
 ```
 
 ---

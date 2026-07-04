@@ -30,6 +30,19 @@ from scraper import USER_AGENT, DomainThrottle, parse_page
 
 PRICE_RE = re.compile(r"[\$€£₹]\s?\d[\d,.]*")
 
+# Standing market feeds — scraped like companies, but tagged with a topic so
+# the site can filter IPO / market-update news separately.
+MARKET_TOPICS = [
+    {"name": "IPO Watch",           "field": "Markets", "topic": "ipo",
+     "news_query": "upcoming IPO stock market listing debut"},
+    {"name": "IPO India",           "field": "Markets", "topic": "ipo",
+     "news_query": "IPO India GMP listing NSE BSE"},
+    {"name": "US Stock Market",     "field": "Markets", "topic": "market",
+     "news_query": "stock market today S&P 500 Nasdaq Dow"},
+    {"name": "Indian Stock Market", "field": "Markets", "topic": "market",
+     "news_query": "Sensex Nifty stock market today"},
+]
+
 
 # ---------------------------------------------------------------- storage
 
@@ -53,16 +66,16 @@ class CompanyStorage:
             "UPDATE companies SET image = %s WHERE name = %s", (image, name))
         self.conn.commit()
 
-    def save_news(self, company, field, items):
+    def save_news(self, company, field, items, topic="general"):
         self.conn.cursor().executemany(
             """INSERT INTO news (company, field, title, link, source,
-                                 published, source_url)
-               VALUES (%s,%s,%s,%s,%s,%s,%s)
+                                 published, source_url, topic)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                ON CONFLICT (link) DO UPDATE SET
                    source_url = COALESCE(EXCLUDED.source_url,
                                          news.source_url)""",
             [(company, field, i["title"], i["link"], i["source"],
-              db.parse_pubdate(i["published"]), i["source_url"])
+              db.parse_pubdate(i["published"]), i["source_url"], topic)
              for i in items])
         self.conn.commit()
 
@@ -101,9 +114,8 @@ class CompanyStorage:
 
 # ---------------------------------------------------------------- fetchers
 
-async def fetch_news(session, company, limit):
-    """Google News RSS search for the company name."""
-    query = company.get("news_query", company["name"])
+async def fetch_news(session, query, limit):
+    """Google News RSS search for an arbitrary query."""
     url = (f"https://news.google.com/rss/search?q={quote(query)}"
            f"&hl=en-US&gl=US&ceid=US:en")
     async with session.get(url) as resp:
@@ -222,7 +234,8 @@ async def worker(worker_id, queue, session, throttle, storage, cfg, stats):
         kind, company = await queue.get()
         name, field = company["name"], company["field"]
         try:
-            host = {"news": "news.google.com", "jobs": "ats",
+            host = {"news": "news.google.com", "stocks": "news.google.com",
+                    "market": "news.google.com", "jobs": "ats",
                     "products": None, "brand": None}[kind]
             if kind == "products":
                 host = urlparse(company["products_url"]).netloc
@@ -232,10 +245,24 @@ async def worker(worker_id, queue, session, throttle, storage, cfg, stats):
                 await throttle.wait(host)
 
             if kind == "news":
-                items = await fetch_news(session, company, cfg.news_limit)
+                query = company.get("news_query", name)
+                items = await fetch_news(session, query, cfg.news_limit)
                 storage.save_news(name, field, items)
                 stats["news"] += len(items)
                 print(f"[w{worker_id}] news     {name}: {len(items)} articles")
+            elif kind == "stocks":
+                query = f'{company.get("news_query", name)} stock price'
+                items = await fetch_news(session, query, cfg.news_limit)
+                storage.save_news(name, field, items, topic="stock")
+                stats["news"] += len(items)
+                print(f"[w{worker_id}] stocks   {name}: {len(items)} articles")
+            elif kind == "market":
+                items = await fetch_news(
+                    session, company["news_query"], cfg.news_limit)
+                storage.save_news(name, field, items,
+                                  topic=company["topic"])
+                stats["news"] += len(items)
+                print(f"[w{worker_id}] market   {name}: {len(items)} articles")
             elif kind == "jobs":
                 items = await fetch_jobs(session, company, cfg.jobs_limit)
                 storage.save_jobs(name, field, items)
@@ -274,12 +301,17 @@ async def run(cfg):
     for c in companies:
         if cfg.only in (None, "news"):
             queue.put_nowait(("news", c))
+        if cfg.only in (None, "stocks"):
+            queue.put_nowait(("stocks", c))
         if cfg.only in (None, "jobs") and c.get("ats"):
             queue.put_nowait(("jobs", c))
         if cfg.only in (None, "products") and c.get("products_url"):
             queue.put_nowait(("products", c))
         if cfg.only in (None, "brand") and c.get("website"):
             queue.put_nowait(("brand", c))
+    if cfg.only in (None, "market") and not cfg.field:
+        for topic in MARKET_TOPICS:
+            queue.put_nowait(("market", topic))
 
     storage = CompanyStorage()
     storage.save_companies(companies)
@@ -310,7 +342,9 @@ def main():
                     help="Max news articles per company")
     ap.add_argument("--jobs-limit", type=int, default=50,
                     help="Max job listings per company")
-    ap.add_argument("--only", choices=["news", "jobs", "products", "brand"],
+    ap.add_argument("--only",
+                    choices=["news", "stocks", "market", "jobs", "products",
+                             "brand"],
                     help="Scrape only one data type")
     ap.add_argument("--field", help="Only companies whose field matches"
                     " (e.g. AI, Finance, Technology)")
