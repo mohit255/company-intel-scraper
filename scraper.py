@@ -102,6 +102,44 @@ except ImportError:
 USER_AGENT = "Mozilla/5.0 (compatible; CompanyIntelScraper/1.0)"
 
 
+class DomainThrottle:
+    """Enforces a minimum delay between requests to the same domain,
+    shared across all workers."""
+
+    def __init__(self, delay: float):
+        self.delay = delay
+        self._locks = {}
+        self._last_fetch = {}
+
+    async def wait(self, domain: str):
+        lock = self._locks.setdefault(domain, asyncio.Lock())
+        async with lock:
+            elapsed = time.monotonic() - self._last_fetch.get(domain, 0.0)
+            if elapsed < self.delay:
+                await asyncio.sleep(self.delay - elapsed)
+            self._last_fetch[domain] = time.monotonic()
+
+
+def parse_page(url: str, html: str):
+    soup = BeautifulSoup(html, "html.parser")
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    desc_tag = soup.find("meta", attrs={"name": "description"})
+    description = desc_tag.get("content", "") if desc_tag else ""
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    text = " ".join(soup.get_text(separator=" ").split())
+
+    links = set()
+    for a in soup.find_all("a", href=True):
+        link, _ = urldefrag(urljoin(url, a["href"]))
+        if urlparse(link).scheme in ("http", "https"):
+            links.add(link)
+
+    return title, description, text, sorted(links)
+
+
 # Simple date parser fallback
 def parse_date_simple(date_string):
     if not date_string:
@@ -121,6 +159,26 @@ def parse_date_simple(date_string):
         except ValueError:
             continue
     return None
+
+
+def parse_rss_date(date_string):
+    """RSS pubDate -> datetime (used both for storage and recency filtering)."""
+    if not date_string:
+        return None
+    if HAS_DATEUTIL:
+        try:
+            return date_parser.parse(date_string)
+        except Exception:
+            return None
+    return parse_date_simple(date_string)
+
+
+def _as_aware_utc(dt):
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 @dataclass
@@ -162,16 +220,8 @@ class CompanyStorage:
     def save_news(self, company: str, field: str, title: str, link: str, 
                   source: str = None, published: str = None, topic: str = 'general'):
         try:
-            pub_date = None
-            if published:
-                if HAS_DATEUTIL:
-                    try:
-                        pub_date = date_parser.parse(published)
-                    except:
-                        pub_date = None
-                else:
-                    pub_date = parse_date_simple(published)
-            
+            pub_date = parse_rss_date(published)
+
             with self.conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO news (company, field, title, link, source, published, topic)
@@ -188,7 +238,13 @@ class CompanyStorage:
             print(f"Error saving news: {e}", file=sys.stderr)
             self.conn.rollback()
             return None
-    
+
+    def get_latest_news_date(self, company: str):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT MAX(published) AS latest FROM news WHERE company = %s", (company,))
+            row = cur.fetchone()
+            return row['latest'] if row else None
+
     def save_job(self, company: str, field: str, title: str, location: str, 
                  url: str, posted_at: str = None):
         try:
@@ -346,28 +402,39 @@ class CompanyScraper:
         html = await self.fetch_url(search_url)
         if not html:
             return news_items
-        
+
+        latest_known = _as_aware_utc(self.storage.get_latest_news_date(company_name))
+
         try:
             soup = BeautifulSoup(html, 'xml')
             items = soup.find_all('item')[:self.config.max_news_per_company]
-            
+
             for item in items:
                 title = item.title.text if item.title else ''
                 link = item.link.text if item.link else ''
-                pub_date = item.pubDate.text if item.pubDate else ''
+                pub_date_raw = item.pubDate.text if item.pubDate else ''
                 source = item.source.text if item.source else ''
-                
-                if title and link:
-                    self.storage.save_news(
-                        company=company_name,
-                        field=field,
-                        title=title,
-                        link=link,
-                        source=source,
-                        published=pub_date,
-                        topic='general'
-                    )
-                    news_items.append({'title': title, 'link': link})
+
+                if not (title and link):
+                    continue
+
+                # Skip anything not newer than what we already have for this
+                # company — avoids re-processing the same old search matches
+                # on every run.
+                pub_date = _as_aware_utc(parse_rss_date(pub_date_raw))
+                if latest_known and pub_date and pub_date <= latest_known:
+                    continue
+
+                self.storage.save_news(
+                    company=company_name,
+                    field=field,
+                    title=title,
+                    link=link,
+                    source=source,
+                    published=pub_date_raw,
+                    topic='general'
+                )
+                news_items.append({'title': title, 'link': link})
         except Exception as e:
             print(f"  Error parsing news RSS: {e}")
         
