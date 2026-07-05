@@ -1,296 +1,692 @@
 #!/usr/bin/env python3
 """
-Async web scraper with a worker pool.
-
-A queue of URLs feeds N concurrent workers. Each worker fetches a page,
-extracts title/text/links, stores the result in SQLite, and pushes newly
-discovered same-domain links back onto the queue.
-
-Usage:
-    python scraper.py https://quotes.toscrape.com --workers 8 --max-pages 50
+Company Intelligence Scraper with Proxy Support
+Scrapes news, jobs, and products for companies and stores in PostgreSQL
 """
 
 import argparse
 import asyncio
 import json
-import sqlite3
 import sys
 import time
-import urllib.robotparser
+import re
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Optional, List, Dict, Any, Set, Tuple
 from urllib.parse import urljoin, urldefrag, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
 
-USER_AGENT = "Mozilla/5.0 (compatible; MiniScraper/1.0)"
+# Try to import dateutil, fallback to simple parsing
+try:
+    from dateutil import parser as date_parser
+    HAS_DATEUTIL = True
+except ImportError:
+    HAS_DATEUTIL = False
+    print("Warning: python-dateutil not installed. Using simple date parsing.", file=sys.stderr)
+
+# Import database
+try:
+    from db import connect, init_db, DB_URL
+    HAS_POSTGRES = True
+except ImportError:
+    print("Error: db.py not found!", file=sys.stderr)
+    sys.exit(1)
+
+# Import proxy manager
+try:
+    from proxy_manager import ProxyManager
+    HAS_PROXY_MANAGER = True
+except ImportError:
+    HAS_PROXY_MANAGER = False
+    print("Warning: proxy_manager.py not found. Using fallback.", file=sys.stderr)
+    
+    class ProxyManager:
+        def __init__(self, proxy_list=None, rotation_strategy='random', max_failures=3, **kwargs):
+            self.proxy_list = proxy_list or []
+            self.rotation_strategy = rotation_strategy
+            self.current_index = 0
+            self.failed_proxies = {}
+        
+        def get_proxy(self):
+            if not self.proxy_list:
+                return None
+            working = [p for p in self.proxy_list if self.failed_proxies.get(p, 0) < 3]
+            if not working:
+                self.failed_proxies.clear()
+                working = self.proxy_list
+            if self.rotation_strategy == 'random':
+                import random
+                return random.choice(working)
+            else:
+                self.current_index = (self.current_index + 1) % len(working)
+                return working[self.current_index]
+        
+        def mark_success(self, proxy_url):
+            if proxy_url:
+                self.failed_proxies[proxy_url] = max(0, self.failed_proxies.get(proxy_url, 0) - 1)
+        
+        def mark_failure(self, proxy_url):
+            if proxy_url:
+                self.failed_proxies[proxy_url] = self.failed_proxies.get(proxy_url, 0) + 1
+        
+        def get_stats(self):
+            working = [p for p in self.proxy_list if self.failed_proxies.get(p, 0) < 3]
+            return {
+                'total_proxies': len(self.proxy_list),
+                'working_proxies': len(working),
+                'dead_proxies': len(self.proxy_list) - len(working)
+            }
+        
+        def close(self):
+            pass
+        
+        @staticmethod
+        def load_from_file(file_path):
+            proxies = []
+            try:
+                with open(file_path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            if not line.startswith(('http://', 'https://')):
+                                line = f'http://{line}'
+                            proxies.append(line)
+                print(f"Loaded {len(proxies)} proxies from {file_path}")
+            except Exception as e:
+                print(f"Error loading proxies: {e}")
+            return proxies
+
+USER_AGENT = "Mozilla/5.0 (compatible; CompanyIntelScraper/1.0)"
+
+
+# Simple date parser fallback
+def parse_date_simple(date_string):
+    if not date_string:
+        return None
+    formats = [
+        '%a, %d %b %Y %H:%M:%S %Z',
+        '%a, %d %b %Y %H:%M:%S %z',
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S.%f',
+        '%Y-%m-%d',
+        '%d %b %Y',
+        '%B %d, %Y',
+    ]
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_string, fmt)
+        except ValueError:
+            continue
+    return None
 
 
 @dataclass
 class Config:
-    seed_urls: list
+    companies_file: str = "companies.json"
     workers: int = 8
-    max_pages: int = 100
-    max_depth: int = 3
-    delay: float = 0.5          # per-domain politeness delay in seconds
-    timeout: float = 15.0
-    db_path: str = "scraped.db"
-    same_domain_only: bool = True
+    max_news_per_company: int = 15
+    max_jobs_per_company: int = 15
+    max_products_per_company: int = 10
+    delay: float = 1.0
+    timeout: float = 30.0
     respect_robots: bool = True
+    proxies: Optional[List[str]] = None
+    proxy_rotation: str = 'random'
+    proxy_health_check: bool = True
+    max_proxy_failures: int = 3
 
 
-# ---------------------------------------------------------------- storage
+def load_companies(file_path: str) -> List[Dict]:
+    try:
+        with open(file_path, 'r') as f:
+            companies = json.load(f)
+        print(f"Loaded {len(companies)} companies from {file_path}")
+        return companies
+    except FileNotFoundError:
+        print(f"Error: {file_path} not found!", file=sys.stderr)
+        return []
+    except json.JSONDecodeError as e:
+        print(f"Error parsing {file_path}: {e}", file=sys.stderr)
+        return []
 
-class Storage:
-    """SQLite storage. A single writer is safe because workers hand results
-    to the event loop thread; sqlite3 handles serialization here."""
 
-    def __init__(self, db_path: str):
-        self.conn = sqlite3.connect(db_path)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS pages (
-                url          TEXT PRIMARY KEY,
-                status       INTEGER,
-                title        TEXT,
-                description  TEXT,
-                text_content TEXT,
-                links_found  INTEGER,
-                depth        INTEGER,
-                fetched_at   TEXT
-            )
-        """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS links (
-                from_url TEXT,
-                to_url   TEXT,
-                UNIQUE(from_url, to_url)
-            )
-        """)
-        self.conn.commit()
-
-    def save_page(self, url, status, title, description, text, links, depth):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO pages VALUES (?,?,?,?,?,?,?,?)",
-            (url, status, title, description, text, len(links), depth,
-             datetime.now(timezone.utc).isoformat()),
-        )
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO links VALUES (?,?)",
-            [(url, link) for link in links],
-        )
-        self.conn.commit()
-
-    def page_count(self):
-        return self.conn.execute("SELECT COUNT(*) FROM pages").fetchone()[0]
-
+class CompanyStorage:
+    def __init__(self):
+        self.conn = connect()
+        init_db(self.conn)
+        print(f"Connected to PostgreSQL: {DB_URL}")
+    
+    def save_news(self, company: str, field: str, title: str, link: str, 
+                  source: str = None, published: str = None, topic: str = 'general'):
+        try:
+            pub_date = None
+            if published:
+                if HAS_DATEUTIL:
+                    try:
+                        pub_date = date_parser.parse(published)
+                    except:
+                        pub_date = None
+                else:
+                    pub_date = parse_date_simple(published)
+            
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO news (company, field, title, link, source, published, topic)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (link) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        published = EXCLUDED.published,
+                        fetched_at = NOW()
+                    RETURNING id
+                """, (company, field, title, link, source, pub_date, topic))
+                self.conn.commit()
+                return cur.fetchone()['id']
+        except Exception as e:
+            print(f"Error saving news: {e}", file=sys.stderr)
+            self.conn.rollback()
+            return None
+    
+    def save_job(self, company: str, field: str, title: str, location: str, 
+                 url: str, posted_at: str = None):
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO jobs (company, field, title, location, url, posted_at)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (url) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        location = EXCLUDED.location,
+                        posted_at = EXCLUDED.posted_at,
+                        fetched_at = NOW()
+                    RETURNING id
+                """, (company, field, title, location, url, posted_at))
+                self.conn.commit()
+                return cur.fetchone()['id']
+        except Exception as e:
+            print(f"Error saving job: {e}", file=sys.stderr)
+            self.conn.rollback()
+            return None
+    
+    def save_product(self, company: str, field: str, url: str, 
+                     page_title: str = None, prices: List = None, 
+                     text_snippet: str = None, image: str = None):
+        try:
+            prices = prices or []
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO products (company, field, url, page_title, prices, text_snippet, image)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (url) DO UPDATE SET
+                        page_title = EXCLUDED.page_title,
+                        prices = EXCLUDED.prices,
+                        text_snippet = EXCLUDED.text_snippet,
+                        image = EXCLUDED.image,
+                        fetched_at = NOW()
+                    RETURNING id
+                """, (company, field, url, page_title, json.dumps(prices), text_snippet, image))
+                self.conn.commit()
+                return cur.fetchone()['id']
+        except Exception as e:
+            print(f"Error saving product: {e}", file=sys.stderr)
+            self.conn.rollback()
+            return None
+    
+    def get_stats(self):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM news")
+            news_count = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(*) FROM jobs")
+            jobs_count = cur.fetchone()['count']
+            cur.execute("SELECT COUNT(*) FROM products")
+            products_count = cur.fetchone()['count']
+            return {
+                'news': news_count,
+                'jobs': jobs_count,
+                'products': products_count
+            }
+    
     def close(self):
         self.conn.close()
 
 
-# ---------------------------------------------------------------- politeness
-
-class DomainThrottle:
-    """Enforces a minimum delay between requests to the same domain,
-    shared across all workers."""
-
-    def __init__(self, delay: float):
-        self.delay = delay
-        self._locks = {}
-        self._last_fetch = {}
-
-    async def wait(self, domain: str):
-        lock = self._locks.setdefault(domain, asyncio.Lock())
-        async with lock:
-            elapsed = time.monotonic() - self._last_fetch.get(domain, 0.0)
-            if elapsed < self.delay:
-                await asyncio.sleep(self.delay - elapsed)
-            self._last_fetch[domain] = time.monotonic()
-
-
-class RobotsCache:
-    """Fetches and caches robots.txt per domain."""
-
-    def __init__(self, session: aiohttp.ClientSession):
-        self.session = session
-        self._parsers = {}
-
-    async def allowed(self, url: str) -> bool:
-        parsed = urlparse(url)
-        base = f"{parsed.scheme}://{parsed.netloc}"
-        if base not in self._parsers:
-            rp = urllib.robotparser.RobotFileParser()
-            try:
-                async with self.session.get(f"{base}/robots.txt") as resp:
-                    if resp.status == 200:
-                        rp.parse((await resp.text()).splitlines())
-                    else:
-                        rp.allow_all = True
-            except Exception:
-                rp.allow_all = True
-            self._parsers[base] = rp
-        return self._parsers[base].can_fetch(USER_AGENT, url)
-
-
-# ---------------------------------------------------------------- parsing
-
-def parse_page(url: str, html: str):
-    soup = BeautifulSoup(html, "html.parser")
-
-    title = soup.title.get_text(strip=True) if soup.title else ""
-    desc_tag = soup.find("meta", attrs={"name": "description"})
-    description = desc_tag.get("content", "") if desc_tag else ""
-
-    for tag in soup(["script", "style", "noscript"]):
-        tag.decompose()
-    text = " ".join(soup.get_text(separator=" ").split())
-
-    links = set()
-    for a in soup.find_all("a", href=True):
-        link, _ = urldefrag(urljoin(url, a["href"]))
-        if urlparse(link).scheme in ("http", "https"):
-            links.add(link)
-
-    return title, description, text, sorted(links)
-
-
-# ---------------------------------------------------------------- crawler
-
-class Crawler:
+class CompanyScraper:
     def __init__(self, config: Config):
-        self.cfg = config
-        self.queue = asyncio.Queue()
-        self.seen = set()
-        self.storage = Storage(config.db_path)
-        self.throttle = DomainThrottle(config.delay)
-        self.pages_scraped = 0
-        self.pages_claimed = 0
+        self.config = config
+        self.storage = CompanyStorage()
+        self.proxy_manager = None
+        self.proxy_url = None
+        
+        if config.proxies:
+            self.proxy_manager = ProxyManager(
+                proxy_list=config.proxies,
+                rotation_strategy=config.proxy_rotation,
+                max_failures=config.max_proxy_failures
+            )
+            print(f"Proxy manager initialized with {len(config.proxies)} proxies")
+        
+        self.session = None
+        self.total_news = 0
+        self.total_jobs = 0
+        self.total_products = 0
         self.errors = 0
-        self.seed_domains = {urlparse(u).netloc for u in config.seed_urls}
-
-    def should_follow(self, url: str) -> bool:
-        if self.cfg.same_domain_only:
-            return urlparse(url).netloc in self.seed_domains
-        return True
-
-    async def worker(self, worker_id: int, session, robots):
-        while True:
-            url, depth = await self.queue.get()
-            claimed = stored = False
-            try:
-                # Reserve a slot before the first await, otherwise concurrent
-                # workers overshoot max_pages while fetches are in flight.
-                if self.pages_claimed >= self.cfg.max_pages:
-                    continue
-                self.pages_claimed += 1
-                claimed = True
-
-                if self.cfg.respect_robots and not await robots.allowed(url):
-                    print(f"[w{worker_id}] blocked by robots.txt: {url}")
-                    continue
-
-                await self.throttle.wait(urlparse(url).netloc)
-
-                async with session.get(url) as resp:
-                    if "text/html" not in resp.headers.get("Content-Type", ""):
-                        continue
-                    html = await resp.text()
-                    status = resp.status
-
-                title, description, text, links = parse_page(url, html)
-                self.storage.save_page(
-                    url, status, title, description, text, links, depth)
-                self.pages_scraped += 1
-                stored = True
-                print(f"[w{worker_id}] {status} ({self.pages_scraped}/"
-                      f"{self.cfg.max_pages}) depth={depth} {url}")
-
-                if depth < self.cfg.max_depth:
-                    for link in links:
-                        if link not in self.seen and self.should_follow(link):
-                            self.seen.add(link)
-                            self.queue.put_nowait((link, depth + 1))
-
-            except Exception as exc:
-                self.errors += 1
-                print(f"[w{worker_id}] ERROR {url}: {exc}", file=sys.stderr)
-            finally:
-                if claimed and not stored:
-                    self.pages_claimed -= 1
-                self.queue.task_done()
-
+    
+    def _get_proxy(self):
+        """Get proxy URL string - handles both string and dict returns"""
+        if not self.proxy_manager:
+            return None
+        
+        proxy = self.proxy_manager.get_proxy()
+        
+        if proxy is None:
+            return None
+        
+        if isinstance(proxy, dict):
+            return proxy.get('http') or proxy.get('https')
+        
+        if isinstance(proxy, str):
+            return proxy
+        
+        return str(proxy)
+    
+    def _mark_proxy_success(self):
+        if self.proxy_manager and self.proxy_url:
+            if isinstance(self.proxy_url, dict):
+                proxy_str = self.proxy_url.get('http') or self.proxy_url.get('https')
+            else:
+                proxy_str = self.proxy_url
+            if proxy_str:
+                self.proxy_manager.mark_success(proxy_str)
+    
+    def _mark_proxy_failure(self):
+        if self.proxy_manager and self.proxy_url:
+            if isinstance(self.proxy_url, dict):
+                proxy_str = self.proxy_url.get('http') or self.proxy_url.get('https')
+            else:
+                proxy_str = self.proxy_url
+            if proxy_str:
+                self.proxy_manager.mark_failure(proxy_str)
+    
+    async def fetch_url(self, url: str, headers: Dict = None) -> Optional[str]:
+        self.proxy_url = self._get_proxy()
+        
+        proxy_str = None
+        if self.proxy_url:
+            if isinstance(self.proxy_url, dict):
+                proxy_str = self.proxy_url.get('http') or self.proxy_url.get('https')
+            elif isinstance(self.proxy_url, str):
+                proxy_str = self.proxy_url
+        
+        try:
+            await asyncio.sleep(self.config.delay)
+            
+            async with self.session.get(url, proxy=proxy_str, timeout=self.config.timeout) as resp:
+                if resp.status == 200:
+                    self._mark_proxy_success()
+                    return await resp.text()
+                else:
+                    self._mark_proxy_failure()
+                    print(f"  HTTP {resp.status} for {url}")
+                    return None
+        except Exception as e:
+            self._mark_proxy_failure()
+            print(f"  Error fetching {url}: {e}")
+            return None
+    
+    async def scrape_news(self, company: Dict) -> List[Dict]:
+        news_items = []
+        company_name = company['name']
+        field = company.get('field', 'general')
+        news_query = company.get('news_query', company_name)
+        
+        search_url = f"https://news.google.com/rss/search?q={news_query.replace(' ', '+')}&hl=en-US&gl=US&ceid=US:en"
+        
+        html = await self.fetch_url(search_url)
+        if not html:
+            return news_items
+        
+        try:
+            soup = BeautifulSoup(html, 'xml')
+            items = soup.find_all('item')[:self.config.max_news_per_company]
+            
+            for item in items:
+                title = item.title.text if item.title else ''
+                link = item.link.text if item.link else ''
+                pub_date = item.pubDate.text if item.pubDate else ''
+                source = item.source.text if item.source else ''
+                
+                if title and link:
+                    self.storage.save_news(
+                        company=company_name,
+                        field=field,
+                        title=title,
+                        link=link,
+                        source=source,
+                        published=pub_date,
+                        topic='general'
+                    )
+                    news_items.append({'title': title, 'link': link})
+        except Exception as e:
+            print(f"  Error parsing news RSS: {e}")
+        
+        print(f"  Scraped {len(news_items)} news articles")
+        return news_items
+    
+    async def scrape_jobs(self, company: Dict) -> List[Dict]:
+        jobs = []
+        company_name = company['name']
+        field = company.get('field', 'general')
+        
+        ats = company.get('ats', {})
+        
+        if ats.get('type') == 'greenhouse':
+            jobs = await self._scrape_greenhouse_jobs(company, ats)
+        elif ats.get('type') == 'lever':
+            jobs = await self._scrape_lever_jobs(company, ats)
+        elif ats.get('type') == 'ashby':
+            jobs = await self._scrape_ashby_jobs(company, ats)
+        elif ats.get('type') == 'workday':
+            jobs = await self._scrape_workday_jobs(company, ats)
+        
+        for job in jobs:
+            self.storage.save_job(
+                company=company_name,
+                field=field,
+                title=job.get('title', ''),
+                location=job.get('location', ''),
+                url=job.get('url', ''),
+                posted_at=job.get('posted_at')
+            )
+        
+        print(f"  Scraped {len(jobs)} jobs")
+        return jobs
+    
+    async def _scrape_greenhouse_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
+        board = ats.get('board')
+        if not board:
+            return []
+        
+        url = f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs"
+        html = await self.fetch_url(url)
+        if not html:
+            return []
+        
+        try:
+            data = json.loads(html)
+            jobs = []
+            for job in data.get('jobs', [])[:self.config.max_jobs_per_company]:
+                jobs.append({
+                    'title': job.get('title', ''),
+                    'location': job.get('location', {}).get('name', ''),
+                    'url': job.get('absolute_url', ''),
+                    'posted_at': job.get('updated_at', '').split('T')[0]
+                })
+            return jobs
+        except Exception as e:
+            print(f"  Error parsing Greenhouse jobs: {e}")
+            return []
+    
+    async def _scrape_lever_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
+        org = ats.get('org')
+        if not org:
+            return []
+        
+        url = f"https://api.lever.co/v0/postings/{org}"
+        html = await self.fetch_url(url)
+        if not html:
+            return []
+        
+        try:
+            data = json.loads(html)
+            jobs = []
+            for job in data[:self.config.max_jobs_per_company]:
+                jobs.append({
+                    'title': job.get('text', ''),
+                    'location': job.get('categories', {}).get('location', ''),
+                    'url': job.get('hostedUrl', ''),
+                    'posted_at': job.get('createdAt', '').split('T')[0]
+                })
+            return jobs
+        except Exception as e:
+            print(f"  Error parsing Lever jobs: {e}")
+            return []
+    
+    async def _scrape_ashby_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
+        board = ats.get('board')
+        if not board:
+            return []
+        
+        url = f"https://api.ashbyhq.com/posting-api/{board}/list"
+        html = await self.fetch_url(url)
+        if not html:
+            return []
+        
+        try:
+            data = json.loads(html)
+            jobs = []
+            for job in data.get('jobs', [])[:self.config.max_jobs_per_company]:
+                jobs.append({
+                    'title': job.get('title', ''),
+                    'location': job.get('location', {}).get('name', ''),
+                    'url': job.get('jobUrl', ''),
+                    'posted_at': job.get('publishedAt', '').split('T')[0]
+                })
+            return jobs
+        except Exception as e:
+            print(f"  Error parsing Ashby jobs: {e}")
+            return []
+    
+    async def _scrape_workday_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
+        return []
+    
+    async def scrape_products(self, company: Dict) -> List[Dict]:
+        products = []
+        company_name = company['name']
+        field = company.get('field', 'general')
+        products_url = company.get('products_url')
+        
+        if not products_url:
+            return products
+        
+        html = await self.fetch_url(products_url)
+        if not html:
+            return products
+        
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            product_elements = soup.find_all(['div', 'li', 'article'], 
+                                             class_=re.compile(r'product|item|card'))[:self.config.max_products_per_company]
+            
+            for elem in product_elements:
+                title_elem = elem.find(['h2', 'h3', 'h4', 'span', 'div'], 
+                                       class_=re.compile(r'title|name|product'))
+                price_elem = elem.find(['span', 'div'], class_=re.compile(r'price|cost|amount'))
+                link_elem = elem.find('a', href=True)
+                img_elem = elem.find('img', src=True)
+                
+                title = title_elem.text.strip() if title_elem else ''
+                price = price_elem.text.strip() if price_elem else ''
+                link = urljoin(products_url, link_elem['href']) if link_elem else products_url
+                image = img_elem['src'] if img_elem else ''
+                
+                if title:
+                    self.storage.save_product(
+                        company=company_name,
+                        field=field,
+                        url=link,
+                        page_title=title,
+                        prices=[price] if price else [],
+                        text_snippet=title,
+                        image=image
+                    )
+                    products.append({
+                        'title': title,
+                        'price': price,
+                        'url': link
+                    })
+        except Exception as e:
+            print(f"  Error parsing products: {e}")
+        
+        print(f"  Scraped {len(products)} products")
+        return products
+    
+    async def scrape_company(self, company: Dict) -> Dict:
+        company_name = company['name']
+        print(f"\nScraping {company_name}...")
+        
+        try:
+            news = await self.scrape_news(company)
+            jobs = await self.scrape_jobs(company)
+            products = await self.scrape_products(company)
+            
+            self.total_news += len(news)
+            self.total_jobs += len(jobs)
+            self.total_products += len(products)
+            
+            return {
+                'company': company_name,
+                'news': len(news),
+                'jobs': len(jobs),
+                'products': len(products)
+            }
+        except Exception as e:
+            print(f"  Error scraping {company_name}: {e}")
+            self.errors += 1
+            return {
+                'company': company_name,
+                'error': str(e)
+            }
+    
     async def run(self):
-        for url in self.cfg.seed_urls:
-            self.seen.add(url)
-            self.queue.put_nowait((url, 0))
-
-        timeout = aiohttp.ClientTimeout(total=self.cfg.timeout)
-        headers = {"User-Agent": USER_AGENT}
-        async with aiohttp.ClientSession(
-                timeout=timeout, headers=headers) as session:
-            robots = RobotsCache(session)
-            workers = [
-                asyncio.create_task(self.worker(i, session, robots))
-                for i in range(self.cfg.workers)
-            ]
-            await self.queue.join()
-            for w in workers:
-                w.cancel()
-
-        total = self.storage.page_count()
+        companies = load_companies(self.config.companies_file)
+        if not companies:
+            print("No companies to scrape")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"Starting scraper with {len(companies)} companies")
+        print(f"Workers: {self.config.workers}")
+        print(f"Max news per company: {self.config.max_news_per_company}")
+        print(f"Max jobs per company: {self.config.max_jobs_per_company}")
+        print(f"Max products per company: {self.config.max_products_per_company}")
+        print(f"{'='*60}\n")
+        
+        start_time = time.time()
+        
+        headers = {'User-Agent': USER_AGENT}
+        timeout = aiohttp.ClientTimeout(total=self.config.timeout)
+        
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            self.session = session
+            
+            semaphore = asyncio.Semaphore(self.config.workers)
+            
+            async def process_company(company):
+                async with semaphore:
+                    return await self.scrape_company(company)
+            
+            tasks = [process_company(company) for company in companies]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        elapsed = time.time() - start_time
+        
+        print(f"\n{'='*60}")
+        print("SCRAPING COMPLETE")
+        print(f"{'='*60}")
+        print(f"Companies processed: {len(companies)}")
+        print(f"Total news scraped: {self.total_news}")
+        print(f"Total jobs scraped: {self.total_jobs}")
+        print(f"Total products scraped: {self.total_products}")
+        print(f"Errors: {self.errors}")
+        print(f"Time elapsed: {elapsed:.1f}s")
+        
+        stats = self.storage.get_stats()
+        print(f"\nDatabase totals:")
+        print(f"  News: {stats['news']}")
+        print(f"  Jobs: {stats['jobs']}")
+        print(f"  Products: {stats['products']}")
+        
+        if self.proxy_manager:
+            proxy_stats = self.proxy_manager.get_stats()
+            print(f"\nProxy Statistics:")
+            print(f"  Total proxies: {proxy_stats['total_proxies']}")
+            print(f"  Working: {proxy_stats['working_proxies']}")
+            print(f"  Dead: {proxy_stats['dead_proxies']}")
+        
+        print(f"{'='*60}\n")
+        
         self.storage.close()
-        return total
-
-
-def export_json(db_path: str, out_path: str):
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    rows = [dict(r) for r in conn.execute(
-        "SELECT url, status, title, description, links_found, depth,"
-        " fetched_at FROM pages")]
-    conn.close()
-    with open(out_path, "w") as f:
-        json.dump(rows, f, indent=2)
-    print(f"Exported {len(rows)} pages to {out_path}")
+        if self.proxy_manager:
+            self.proxy_manager.close()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Worker-pool web scraper")
-    ap.add_argument("seeds", nargs="+", help="Seed URL(s) to start from")
-    ap.add_argument("--workers", type=int, default=8)
-    ap.add_argument("--max-pages", type=int, default=100)
-    ap.add_argument("--max-depth", type=int, default=3)
-    ap.add_argument("--delay", type=float, default=0.5,
-                    help="Min seconds between requests to the same domain")
-    ap.add_argument("--db", default="scraped.db")
-    ap.add_argument("--all-domains", action="store_true",
-                    help="Follow links to external domains too")
-    ap.add_argument("--no-robots", action="store_true",
-                    help="Skip robots.txt checks (not recommended)")
-    ap.add_argument("--export-json", metavar="FILE",
-                    help="After crawling, export pages table to JSON")
-    args = ap.parse_args()
-
-    cfg = Config(
-        seed_urls=args.seeds,
+    parser = argparse.ArgumentParser(description="Company Intelligence Scraper with Proxy Support")
+    
+    parser.add_argument("--companies", "-c", default="companies.json",
+                        help="JSON file with company data")
+    parser.add_argument("--workers", "-w", type=int, default=8,
+                        help="Number of concurrent workers")
+    parser.add_argument("--news-limit", type=int, default=15,
+                        help="Max news articles per company")
+    parser.add_argument("--jobs-limit", type=int, default=15,
+                        help="Max jobs per company")
+    parser.add_argument("--products-limit", type=int, default=10,
+                        help="Max products per company")
+    parser.add_argument("--delay", type=float, default=1.0,
+                        help="Delay between requests (seconds)")
+    parser.add_argument("--timeout", type=float, default=30.0,
+                        help="Request timeout (seconds)")
+    
+    parser.add_argument("--proxies", "-p", help="File containing proxy list (one per line)")
+    parser.add_argument("--proxy-rotation", "-r", choices=['random', 'round-robin'],
+                        default='random', help="Proxy rotation strategy")
+    parser.add_argument("--max-proxy-failures", type=int, default=3,
+                        help="Max failures before proxy is removed")
+    parser.add_argument("--test-proxy", help="Test a specific proxy URL and exit")
+    
+    args = parser.parse_args()
+    
+    if args.test_proxy:
+        try:
+            import requests
+            proxies = {'http': args.test_proxy, 'https': args.test_proxy}
+            response = requests.get('https://httpbin.org/ip', proxies=proxies, timeout=10)
+            if response.status_code == 200:
+                print(f"✅ Proxy {args.test_proxy} is working!")
+                print(f"   Response: {response.json()}")
+            else:
+                print(f"❌ Proxy {args.test_proxy} returned status {response.status_code}")
+        except Exception as e:
+            print(f"❌ Proxy {args.test_proxy} is NOT working!")
+            print(f"   Error: {e}")
+        return
+    
+    proxies = []
+    if args.proxies:
+        proxies = ProxyManager.load_from_file(args.proxies)
+    
+    if proxies:
+        print(f"Using {len(proxies)} proxies with {args.proxy_rotation} rotation")
+    
+    config = Config(
+        companies_file=args.companies,
         workers=args.workers,
-        max_pages=args.max_pages,
-        max_depth=args.max_depth,
+        max_news_per_company=args.news_limit,
+        max_jobs_per_company=args.jobs_limit,
+        max_products_per_company=args.products_limit,
         delay=args.delay,
-        db_path=args.db,
-        same_domain_only=not args.all_domains,
-        respect_robots=not args.no_robots,
+        timeout=args.timeout,
+        proxies=proxies if proxies else None,
+        proxy_rotation=args.proxy_rotation,
+        max_proxy_failures=args.max_proxy_failures
     )
-
-    start = time.monotonic()
-    crawler = Crawler(cfg)
-    total = asyncio.run(crawler.run())
-    elapsed = time.monotonic() - start
-    print(f"\nDone: {total} pages stored in {cfg.db_path} "
-          f"({crawler.errors} errors) in {elapsed:.1f}s")
-
-    if args.export_json:
-        export_json(cfg.db_path, args.export_json)
+    
+    scraper = CompanyScraper(config)
+    asyncio.run(scraper.run())
 
 
 if __name__ == "__main__":

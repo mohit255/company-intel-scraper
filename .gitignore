@@ -18,6 +18,19 @@ build/
 # Logs
 logs/
 
+# Proxy pool (runtime-generated, refreshed by cron/fetch scripts)
+proxies.txt
+proxies_working.txt
+proxies_failed.txt
+working_proxies.txt
+failed_proxies.txt
+working_proxies_cache.json
+master_proxy_list.json
+
+# DB backups (see README cron section)
+backups/
+*.sql
+
 # macOS
 .DS_Store
 
@@ -25,3 +38,11 @@ logs/
 .vscode/
 .idea/
 *.swp
+
+# Scratch / backup files — don't let dev copies sneak back into the repo
+*.backup
+*.backup[0-9]*
+*.broken
+*_bk
+*_pk
+=[0-9]*
