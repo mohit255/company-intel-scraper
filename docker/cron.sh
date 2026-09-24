@@ -26,7 +26,14 @@ if ! DOCKER_ERR="$(docker info 2>&1 >/dev/null)"; then
     exit 1
 fi
 
-DC="docker compose"
+# On Linux, always use host networking so localhost in DATABASE_URL reaches
+# the host's Postgres (don't rely on COMPOSE_FILE being set in .env).
+if [ "$(uname -s)" = "Linux" ]; then
+    DC="docker compose -f docker-compose.yml -f docker-compose.linux.yml"
+else
+    DC="docker compose -f docker-compose.yml"
+fi
+echo "Compose: $DC"
 # DB jobs run against the local Postgres with the host's pg_dump/psql
 set -a; source .env; set +a
 

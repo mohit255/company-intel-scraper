@@ -154,8 +154,9 @@ COMPOSE_FILE=docker-compose.yml:docker-compose.linux.yml
 chmod 600 .env
 ```
 
-`DATABASE_URL` is the only place credentials come from. `COMPOSE_FILE`
-enables the Linux host-network override. Leave it out on macOS.
+`DATABASE_URL` is the only place credentials come from. `docker/cron.sh`
+loads the Linux host-network override automatically on Linux; `COMPOSE_FILE`
+makes plain `docker compose ...` commands load it too. Leave it out on macOS.
 
 ### Step 5 — (Optional) Restore existing data
 
