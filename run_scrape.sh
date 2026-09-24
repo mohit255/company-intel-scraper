@@ -37,6 +37,24 @@ echo "Database: ${DATABASE_URL##*@}"
 echo "Companies file: $COMPANIES_FILE"
 echo ""
 
+# Fail fast if the database is unreachable (before the slow proxy refresh)
+$PYTHON - <<'PYEOF' || { echo "=== scrape aborted: database unreachable ==="; exit 1; }
+import os, sys, psycopg
+url = os.environ["DATABASE_URL"]
+try:
+    with psycopg.connect(url, connect_timeout=10) as conn:
+        info = conn.info
+        ver = conn.execute("SHOW server_version").fetchone()[0]
+        print(f"✅ DB connected: {info.host}:{info.port}/{info.dbname} as {info.user} (PostgreSQL {ver})")
+except Exception as e:
+    print(f"❌ DB connection FAILED: {str(e).strip()}")
+    if "pg_hba.conf" in str(e):
+        print("   Hint: container is not on the host network - check COMPOSE_FILE in .env "
+              "and that DATABASE_URL uses localhost")
+    sys.exit(1)
+PYEOF
+echo ""
+
 # Check and clean proxies if needed
 if [ -f "$PROXY_FILE" ]; then
     PROXY_COUNT=$(wc -l < "$PROXY_FILE" | tr -d ' ')

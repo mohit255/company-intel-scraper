@@ -174,7 +174,7 @@ Skip this to start empty. The first scrape creates the tables.
 touch proxies.txt proxies_working.txt proxies_failed.txt   # state files mounted into the container
 docker compose build                                       # build the scraper image
 docker/cron.sh scrape                                      # same job cron runs hourly
-tail -30 logs/cron-scrape.log                              # should end with rc=0
+tail -30 logs/cron-scrape.log                              # first lines: ✅ DB connected; last line: rc=0
 ```
 
 ### Step 7 — Install the cron jobs
@@ -209,6 +209,7 @@ docker compose build     # the next cron run uses the new image
 | Symptom | Fix |
 |---|---|
 | `permission denied ... docker.sock` in cron logs | User not in `docker` group: `sudo usermod -aG docker $USER`, then log in again |
+| `❌ DB connection FAILED: ... no pg_hba.conf entry for host "172.x"` | Container isn't on the host network: add `COMPOSE_FILE=docker-compose.yml:docker-compose.linux.yml` to `.env`, use `localhost` in `DATABASE_URL`, and check `docker compose config \| grep network_mode` shows `host` |
 | `Connection refused` to Postgres | `COMPOSE_FILE` line missing from `.env`, or Postgres not running: `sudo systemctl status postgresql` |
 | `Conflict. The container name ... is already in use` | The previous run of that job is still going. This is expected (overlap protection). If it's stuck: `docker rm -f company-intel-scrape` |
 | `server version mismatch` from `pg_dump` | Install the `postgresql-client-<server major>` package |

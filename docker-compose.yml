@@ -1,4 +1,4 @@
-name: company-intel
+name: company-intel-scraper
 
 # Uses the Postgres running on the host (DATABASE_URL in .env).
 services:
