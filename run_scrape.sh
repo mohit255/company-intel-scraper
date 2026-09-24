@@ -12,8 +12,9 @@ if [ ! -f "$PYTHON" ]; then
     PYTHON="python3"
 fi
 
-# Set database URL
-export DATABASE_URL="${DATABASE_URL:-postgresql://companyinteluser:Mohit8787@localhost:5432/company_intel}"
+# Database credentials come only from .env / the environment
+: "${DATABASE_URL:?DATABASE_URL is not set - add it to .env}"
+export DATABASE_URL
 
 # Proxy configuration
 PROXY_FILE="${PROXY_FILE:-proxies.txt}"
@@ -32,7 +33,7 @@ COMPANIES_FILE="${COMPANIES_FILE:-companies.json}"
 
 echo "=== scrape started $(date) ==="
 echo "Working directory: $(pwd)"
-echo "Database: $DATABASE_URL"
+echo "Database: ${DATABASE_URL##*@}"
 echo "Companies file: $COMPANIES_FILE"
 echo ""
 

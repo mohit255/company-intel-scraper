@@ -1,0 +1,9 @@
+# Linux servers: share the host network so "localhost" in DATABASE_URL reaches
+# the host's Postgres directly (no listen_addresses / pg_hba changes needed).
+# Enable by adding to .env:  COMPOSE_FILE=docker-compose.yml:docker-compose.linux.yml
+services:
+  scraper:
+    network_mode: host
+    extra_hosts: !reset []
+    environment:
+      DB_HOST_OVERRIDE: ""

@@ -1,7 +1,14 @@
 .venv/
+.git/
+.claude/
 __pycache__/
 *.pyc
 logs/
+backups/
+docker/
 .env
+.env.*
 *.db
 *.json.bak
+proxies*.txt
+working_proxies*

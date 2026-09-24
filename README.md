@@ -14,10 +14,14 @@ of companies (`companies.json`) and stores the results in PostgreSQL.
 | `enrich_locations.py` | Post-processing pass that normalizes `jobs.location` into a `job_locations` table. Idempotent. |
 | `proxy_manager.py` | `ProxyManager` (rotation/failure tracking) + `ProxyFetcher` (pulls proxies from public sources), used by the scripts below. |
 | `fetch_fresh_proxies.py` | One-shot: fetch proxies from public sources, validate, write to `proxies.txt`. |
-| `daily_proxy_updater.py` / `auto_update_proxies.sh` | Scheduled proxy refresh (merges with cache, keeps top N). Set up via `setup_cron.sh`. |
+| `daily_proxy_updater.py` / `auto_update_proxies.sh` | Legacy proxy refresh (merges with cache, keeps top N). Not used by the Docker cron jobs. |
 | `check_proxy_health.py` | Reports pool health; triggers `fetch_fresh_proxies.py` if the working count is low. |
 | `test_and_clean_proxies.py` | Tests every proxy in `proxies.txt` against `httpbin.org` and rewrites the file with only the working ones. |
-| `setup_cron.sh` | Installs the proxy-refresh cron jobs (see [Cron scheduling](#cron-scheduling)). |
+| `setup_cron.sh` | Installs the Docker cron jobs (see [Docker cron jobs](#docker-cron-jobs)). |
+| `docker-compose.yml` | Scraper service (host Postgres via `DATABASE_URL`). |
+| `docker-compose.linux.yml` | Linux override: host networking so `localhost` reaches the server's Postgres. |
+| `docker-entrypoint.sh` | Rewrites `localhost` in `DATABASE_URL` to `host.docker.internal` (macOS Docker Desktop). |
+| `docker/cron.sh` | Cron entry point: `scrape`, `proxies`, `clean-proxies`, `backup`, `vacuum`. |
 
 ---
 
@@ -31,20 +35,184 @@ of companies (`companies.json`) and stores the results in PostgreSQL.
 
 ## Quick start (Docker)
 
+The scraper runs in Docker against the **local (host) Postgres** from
+`DATABASE_URL` in `.env`. Inside the container, `localhost` is rewritten to
+`host.docker.internal` by `docker-entrypoint.sh`, so the same `.env` works
+both on the host and in Docker.
+
 ```bash
 git clone <repo-url> && cd company-intel-scraper
-cp .env.example .env          # fill in DATABASE_URL at minimum
-docker build -t company-scraper .
-docker run --rm --env-file .env company-scraper
+cp .env.example .env                     # DATABASE_URL=postgresql://user:pass@localhost:5432/company_intel
+touch proxies.txt proxies_working.txt proxies_failed.txt
+docker compose build
+docker compose run --rm scraper          # full run_scrape.sh
+docker compose run --rm scraper python enrich_locations.py
 ```
 
-> The Docker image only bundles `db.py`, `scraper.py`, `company_scraper.py`,
-> `enrich_locations.py`, `run_scrape.sh`, and `companies.json` (see
-> `Dockerfile`). `proxy_manager.py` and `fetch_fresh_proxies.py` are **not**
-> copied in, so proxy rotation and auto-refresh are effectively disabled
-> inside the container — it falls back to running with no proxies. Fine for
-> a quick test; if you need proxy support in Docker, add those files to the
-> `COPY` step yourself.
+`logs/`, `companies.json` and the `proxies*.txt` files are bind-mounted, so
+they persist across runs and `companies.json` edits need no rebuild.
+
+### Docker cron jobs
+
+`docker/cron.sh <job>` runs one job and appends to `logs/cron-<job>.log`.
+Scrape/proxy jobs run in a fixed-name container, so an overlapping run of the
+same job is refused instead of piling up. Backup/vacuum use the host's
+`pg_dump`/`psql`.
+
+| Schedule | Job | What it does |
+|---|---|---|
+| `0 * * * *` | `scrape` | `run_scrape.sh` + `enrich_locations.py` |
+| `30 */6 * * *` | `proxies` | `fetch_fresh_proxies.py` |
+| `0 2 * * 0` | `clean-proxies` | `test_and_clean_proxies.py` |
+| `0 1 * * *` | `backup` | `pg_dump` to `backups/*.sql.gz`, keeps 30 days |
+| `0 5 * * 0` | `vacuum` | `VACUUM ANALYZE` |
+
+Install / refresh them (idempotent):
+
+```bash
+./setup_cron.sh
+```
+
+macOS notes: Docker Desktop must be running (Settings -> "Start Docker
+Desktop when you sign in"), and because the repo is under `~/Desktop`,
+`/usr/sbin/cron` and your terminal need **Full Disk Access** (System
+Settings -> Privacy & Security), otherwise `crontab` fails with
+`Operation not permitted`.
+
+---
+
+## Ubuntu server deployment (Docker)
+
+Runs the scraper in Docker on an Ubuntu server, against Postgres installed
+**on that same server**, scheduled with the server's crontab.
+
+On Linux the container shares the host network
+(`docker-compose.linux.yml`), so `localhost` in `DATABASE_URL` reaches the
+server's Postgres directly. You don't need to change `listen_addresses` or
+`pg_hba.conf`.
+
+### Step 1 — Install Docker
+
+```bash
+sudo apt update
+sudo apt install -y ca-certificates curl
+curl -fsSL https://get.docker.com | sudo sh     # Docker Engine + compose plugin
+sudo systemctl enable --now docker              # start now and on every boot
+sudo usermod -aG docker $USER                   # run docker without sudo
+```
+
+Log out and back in, then verify:
+
+```bash
+docker compose version
+```
+
+Cron runs jobs as your user, so `docker` must work **without `sudo`**.
+
+### Step 2 — Postgres + client tools
+
+If Postgres isn't installed yet:
+
+```bash
+sudo apt install -y postgresql postgresql-contrib
+sudo -u postgres psql -c "CREATE USER scraper WITH PASSWORD 'CHANGE_ME';"
+sudo -u postgres psql -c "CREATE DATABASE company_intel OWNER scraper;"
+```
+
+If it already exists, just make sure the client tools are installed:
+
+```bash
+sudo apt install -y postgresql-client
+psql --version
+```
+
+The `backup` and `vacuum` jobs use the host's `pg_dump`/`psql`. `pg_dump`
+must be the same major version as the server or newer.
+
+### Step 3 — Clone the repo
+
+```bash
+git clone -b proxy <repo-url> ~/company-intel-scraper
+cd ~/company-intel-scraper
+```
+
+### Step 4 — Configure `.env`
+
+```bash
+cp .env.example .env
+nano .env
+```
+
+Set at least:
+
+```ini
+DATABASE_URL=postgresql://scraper:CHANGE_ME@localhost:5432/company_intel
+COMPOSE_FILE=docker-compose.yml:docker-compose.linux.yml
+```
+
+```bash
+chmod 600 .env
+```
+
+`DATABASE_URL` is the only place credentials come from. `COMPOSE_FILE`
+enables the Linux host-network override. Leave it out on macOS.
+
+### Step 5 — (Optional) Restore existing data
+
+Copy a backup from another machine (e.g. `backups/company_intel_YYYYMMDD.sql.gz`)
+and load it:
+
+```bash
+gunzip -c company_intel_YYYYMMDD.sql.gz | psql "postgresql://scraper:CHANGE_ME@localhost:5432/company_intel"
+```
+
+Skip this to start empty. The first scrape creates the tables.
+
+### Step 6 — Build and test run
+
+```bash
+touch proxies.txt proxies_working.txt proxies_failed.txt   # state files mounted into the container
+docker compose build                                       # build the scraper image
+docker/cron.sh scrape                                      # same job cron runs hourly
+tail -30 logs/cron-scrape.log                              # should end with rc=0
+```
+
+### Step 7 — Install the cron jobs
+
+```bash
+./setup_cron.sh      # idempotent; installs the jobs from "Docker cron jobs" above
+crontab -l
+```
+
+Run it as your normal user, **not** with `sudo`. Otherwise the jobs land in
+root's crontab and create root-owned files.
+
+### Step 8 — Verify cron fired
+
+After the next full hour:
+
+```bash
+grep "\[scrape\] start" logs/cron-scrape.log | tail -3
+grep CRON /var/log/syslog | tail -5
+```
+
+### Updating the code
+
+```bash
+cd ~/company-intel-scraper
+git pull
+docker compose build     # the next cron run uses the new image
+```
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `permission denied ... docker.sock` in cron logs | User not in `docker` group: `sudo usermod -aG docker $USER`, then log in again |
+| `Connection refused` to Postgres | `COMPOSE_FILE` line missing from `.env`, or Postgres not running: `sudo systemctl status postgresql` |
+| `Conflict. The container name ... is already in use` | The previous run of that job is still going. This is expected (overlap protection). If it's stuck: `docker rm -f company-intel-scrape` |
+| `server version mismatch` from `pg_dump` | Install the `postgresql-client-<server major>` package |
+| `Docker daemon not running - skipping` | `sudo systemctl enable --now docker` |
 
 ---
 
@@ -196,6 +364,7 @@ the only Python module that reads an env var (`DATABASE_URL`) directly.
 | Variable | Default | Meaning |
 |---|---|---|
 | `DATABASE_URL` | — (required) | PostgreSQL connection string |
+| `COMPOSE_FILE` | — | Linux servers only: `docker-compose.yml:docker-compose.linux.yml` |
 | `SCRAPER_WORKERS` | 8 | Concurrent worker tasks |
 | `SCRAPER_NEWS_LIMIT` | 15 | Max news articles per company |
 | `SCRAPER_JOBS_LIMIT` | 15 | Max job listings per company |
@@ -313,16 +482,7 @@ updater) in the repo root.
 ./.venv/bin/python daily_proxy_updater.py
 ```
 
-`setup_cron.sh` installs the recurring jobs for you:
-
-```bash
-chmod +x setup_cron.sh
-./setup_cron.sh
-```
-
-It adds two crontab entries that run `auto_update_proxies.sh` (midnight and
-every 6 hours). **Edit the hardcoded path in `auto_update_proxies.sh` first**
-(`cd /var/www/html/company-intel-scraper`) if your deploy path differs.
+For scheduled runs in Docker, see [Docker cron jobs](#docker-cron-jobs).
 
 ---
 
@@ -366,8 +526,7 @@ grep CRON /var/log/cron         # RHEL/Amazon Linux
 
 ### 2. Proxy maintenance (recommended if `PROXY_FILE` is set)
 
-Handled by `./setup_cron.sh` (midnight + every 6 hours via
-`auto_update_proxies.sh`). To add a weekly deep-clean of the existing list on
+The Docker setup handles this (`./setup_cron.sh`). For bare metal, to add a weekly deep-clean of the existing list on
 top of that:
 
 ```
@@ -478,6 +637,12 @@ The `../company-intel` Next.js app is the front end for this data:
 ```bash
 cd ../company-intel && npm run dev
 ```
+
+It reads the `companies`, `news`, `jobs`, `products`, and `job_locations`
+tables this scraper populates. It also creates and owns one additional
+table of its own, `analytics_events`, for site traffic/click tracking
+(see its README) — this repo has no knowledge of that table and never
+writes to it.
 
 ---
 

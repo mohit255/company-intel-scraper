@@ -1,18 +1,29 @@
 #!/bin/bash
-# Setup daily proxy updates via cron
+# Install (or refresh) the Docker-based cron jobs for this repo.
+# Idempotent: replaces the block between the BEGIN/END markers.
+set -e
+DIR="$(cd "$(dirname "$0")" && pwd)"
+RUN="$DIR/docker/cron.sh"
+BEGIN="# BEGIN company-intel-scraper"
+END="# END company-intel-scraper"
 
-echo "Setting up daily proxy updates..."
+chmod +x "$RUN"
 
-# Make scripts executable
-chmod +x daily_proxy_updater.py auto_update_proxies.sh
+BLOCK="$BEGIN
+# Hourly scrape + location enrichment
+0 * * * * $RUN scrape
+# Refresh proxy pool every 6 hours
+30 */6 * * * $RUN proxies
+# Weekly deep-clean of proxy list (Sun 02:00)
+0 2 * * 0 $RUN clean-proxies
+# Daily DB backup (01:00), keeps 30 days
+0 1 * * * $RUN backup
+# Weekly VACUUM ANALYZE (Sun 05:00)
+0 5 * * 0 $RUN vacuum
+$END"
 
-# Add to crontab (runs daily at midnight)
-(crontab -l 2>/dev/null; echo "0 0 * * * /var/www/html/company-intel-scraper/auto_update_proxies.sh") | crontab -
+EXISTING="$(crontab -l 2>/dev/null | sed "/^$BEGIN\$/,/^$END\$/d" || true)"
+printf '%s\n%s\n' "$EXISTING" "$BLOCK" | sed '/./,$!d' | crontab -
 
-# Also run every 6 hours for fresh proxies
-(crontab -l 2>/dev/null; echo "0 */6 * * * /var/www/html/company-intel-scraper/auto_update_proxies.sh") | crontab -
-
-echo "✅ Daily proxy updates configured!"
-echo "   - Runs at midnight every day"
-echo "   - Also runs every 6 hours"
-echo "   - Logs to: logs/proxy_updater.log"
+echo "Installed cron jobs:"
+crontab -l

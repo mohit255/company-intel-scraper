@@ -1,0 +1,21 @@
+name: company-intel
+
+# Uses the Postgres running on the host (DATABASE_URL in .env).
+services:
+  # One-shot job container: invoked by cron via `docker compose run --rm scraper ...`
+  scraper:
+    build: .
+    image: company-intel-scraper:latest
+    env_file: .env
+    environment:
+      DB_HOST_OVERRIDE: host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Persist runtime state on the host across --rm runs
+      - ./logs:/app/logs
+      - ./companies.json:/app/companies.json:ro
+      - ./proxies.txt:/app/proxies.txt
+      - ./proxies_working.txt:/app/proxies_working.txt
+      - ./proxies_failed.txt:/app/proxies_failed.txt
+
