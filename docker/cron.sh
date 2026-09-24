@@ -18,8 +18,11 @@ touch proxies.txt proxies_working.txt proxies_failed.txt
 exec >>"$LOG" 2>&1
 echo "===== [$JOB] start $(date '+%Y-%m-%d %H:%M:%S') ====="
 
-if ! docker info >/dev/null 2>&1; then
-    echo "Docker daemon not running - skipping"
+if ! DOCKER_ERR="$(docker info 2>&1 >/dev/null)"; then
+    echo "Cannot use Docker as user $(id -un) - skipping:"
+    echo "$DOCKER_ERR" | tail -3
+    echo "Hint: 'permission denied' -> sudo usermod -aG docker $(id -un), then re-login;"
+    echo "      'Is the docker daemon running?' -> sudo systemctl enable --now docker"
     exit 1
 fi
 

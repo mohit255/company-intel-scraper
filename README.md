@@ -212,7 +212,8 @@ docker compose build     # the next cron run uses the new image
 | `Connection refused` to Postgres | `COMPOSE_FILE` line missing from `.env`, or Postgres not running: `sudo systemctl status postgresql` |
 | `Conflict. The container name ... is already in use` | The previous run of that job is still going. This is expected (overlap protection). If it's stuck: `docker rm -f company-intel-scrape` |
 | `server version mismatch` from `pg_dump` | Install the `postgresql-client-<server major>` package |
-| `Docker daemon not running - skipping` | `sudo systemctl enable --now docker` |
+| `Cannot use Docker as user ... permission denied` | `sudo usermod -aG docker $USER`, then log out and back in |
+| `Cannot use Docker ... Is the docker daemon running?` | `sudo systemctl enable --now docker` |
 
 ---
 
