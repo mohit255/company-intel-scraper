@@ -386,6 +386,7 @@ class CompanyScraper:
                 last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
 
         print(f"  Error fetching {url} ({len(attempts)} attempts): {last_error}")
+        self.errors += 1
         return None
     
     async def scrape_news(self, company: Dict) -> List[Dict]:
@@ -434,6 +435,7 @@ class CompanyScraper:
                 news_items.append({'title': title, 'link': link})
         except Exception as e:
             print(f"  Error parsing news RSS: {e}")
+            self.errors += 1
         
         print(f"  Scraped {len(news_items)} news articles")
         return news_items
@@ -490,6 +492,7 @@ class CompanyScraper:
             return jobs
         except Exception as e:
             print(f"  Error parsing Greenhouse jobs: {e}")
+            self.errors += 1
             return []
     
     async def _scrape_lever_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
@@ -515,6 +518,7 @@ class CompanyScraper:
             return jobs
         except Exception as e:
             print(f"  Error parsing Lever jobs: {e}")
+            self.errors += 1
             return []
     
     async def _scrape_ashby_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
@@ -522,7 +526,9 @@ class CompanyScraper:
         if not board:
             return []
         
-        url = f"https://api.ashbyhq.com/posting-api/{board}/list"
+        # /posting-api/<board>/list now returns 401; this is the public
+        # job board endpoint, where location is a plain string
+        url = f"https://api.ashbyhq.com/posting-api/job-board/{board}"
         html = await self.fetch_url(url)
         if not html:
             return []
@@ -531,15 +537,19 @@ class CompanyScraper:
             data = json.loads(html)
             jobs = []
             for job in data.get('jobs', [])[:self.config.max_jobs_per_company]:
+                location = job.get('location') or ''
+                if isinstance(location, dict):  # older API shape: {"name": ...}
+                    location = location.get('name', '')
                 jobs.append({
                     'title': job.get('title', ''),
-                    'location': job.get('location', {}).get('name', ''),
+                    'location': location,
                     'url': job.get('jobUrl', ''),
                     'posted_at': job.get('publishedAt', '').split('T')[0]
                 })
             return jobs
         except Exception as e:
             print(f"  Error parsing Ashby jobs: {e}")
+            self.errors += 1
             return []
     
     async def _scrape_workday_jobs(self, company: Dict, ats: Dict) -> List[Dict]:
@@ -593,6 +603,7 @@ class CompanyScraper:
                     })
         except Exception as e:
             print(f"  Error parsing products: {e}")
+            self.errors += 1
         
         print(f"  Scraped {len(products)} products")
         return products
