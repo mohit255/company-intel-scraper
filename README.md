@@ -25,133 +25,157 @@ of companies (`companies.json`) and stores the results in PostgreSQL.
 
 ---
 
-## Prerequisites
+## Contents
 
-- Python 3.10+
-- PostgreSQL (local, or a managed instance like RDS/Aurora)
-- Docker, if you're using the container path
+- [Setup with Docker (recommended)](#setup-with-docker-recommended): Ubuntu server, step by step
+- [Docker cron jobs](#docker-cron-jobs): what runs when
+- [Daily operations](#daily-operations): health checks, updates, stopping a run
+- [Troubleshooting](#troubleshooting): every issue seen during setup, with the fix
+- [Local development on macOS](#local-development-on-macos-docker-desktop)
+- [Bare-metal setup (without Docker)](#bare-metal-setup-without-docker)
 
 ---
 
-## Quick start (Docker)
+## Setup with Docker (recommended)
 
-The scraper runs in Docker against the **local (host) Postgres** from
-`DATABASE_URL` in `.env`. Inside the container, `localhost` is rewritten to
-`host.docker.internal` by `docker-entrypoint.sh`, so the same `.env` works
-both on the host and in Docker.
+The scraper runs in Docker on an Ubuntu server against a **Postgres installed
+on that same server**, and the server's crontab schedules the jobs. Postgres
+is **not** run in Docker.
 
-```bash
-git clone -b dockerSetup https://github.com/mohit255/company-intel-scraper.git && cd company-intel-scraper
-cp .env.example .env                     # DATABASE_URL=postgresql://user:pass@localhost:5432/company_intel
-touch proxies.txt proxies_working.txt proxies_failed.txt
-docker compose build
-docker compose run --rm scraper          # full run_scrape.sh
-docker compose run --rm scraper python enrich_locations.py
+### How it works
+
+| Piece | Role |
+|---|---|
+| `Dockerfile` | Python 3.12 image with the scraper, proxy tools and `run_scrape.sh` baked in |
+| `docker-compose.yml` | `scraper` service, compose project **`company-intel-scraper`** (unique, so it never clashes with other projects on the server such as `company-intel`). Mounts `logs/`, `companies.json` and `proxies*.txt` from the repo. |
+| `docker-compose.linux.yml` | `network_mode: host`. `localhost` in the container **is the server**, so Postgres sees a normal local connection. No `pg_hba.conf` changes are needed. |
+| `docker-entrypoint.sh` | macOS only: rewrites `localhost` to `host.docker.internal`. Switched off by the Linux file. |
+| `docker/cron.sh <job>` | Entry point for every job. On Linux it **always** adds `docker-compose.linux.yml`. It writes to `logs/cron-<job>.log` and uses a fixed container name as an overlap lock. |
+| `run_scrape.sh` | Checks the DB connection **and** permissions first, and aborts in seconds if either is wrong. Then it refreshes proxies if there are fewer than 50, scrapes, and prints a DB summary. |
+| `setup_cron.sh` | Installs the 5 cron jobs. Safe to run again. |
+
+```
+cron ──> docker/cron.sh scrape ──> docker compose run (host network) ──> run_scrape.sh
+                                                                           │
+                                                          localhost:5432 ──┘──> Postgres on the server
 ```
 
-`logs/`, `companies.json` and the `proxies*.txt` files are bind-mounted, so
-they persist across runs and `companies.json` edits need no rebuild.
+### Requirements
 
-### Docker cron jobs
-
-`docker/cron.sh <job>` runs one job and appends to `logs/cron-<job>.log`.
-Scrape/proxy jobs run in a fixed-name container, so an overlapping run of the
-same job is refused instead of piling up. Backup/vacuum use the host's
-`pg_dump`/`psql`. On Linux, `cron.sh` automatically adds
-`docker-compose.linux.yml` (host networking). Each run logs a `Compose:` line
-and a `✅ DB connected` / `❌ DB connection FAILED` line at the start.
-
-| Schedule | Job | What it does |
+| Need | Version | Why |
 |---|---|---|
-| `0 * * * *` | `scrape` | `run_scrape.sh` + `enrich_locations.py` |
-| `30 */6 * * *` | `proxies` | `fetch_fresh_proxies.py` |
-| `0 2 * * 0` | `clean-proxies` | `test_and_clean_proxies.py` |
-| `0 1 * * *` | `backup` | `pg_dump` to `backups/*.sql.gz`, keeps 30 days |
-| `0 5 * * 0` | `vacuum` | `VACUUM ANALYZE` |
+| Ubuntu | 20.04+ | tested on Ubuntu server |
+| Docker Engine + compose plugin | compose **v2.24+** | `docker-compose.linux.yml` uses `!reset` |
+| PostgreSQL server + client | client major version ≥ server | the backup/vacuum jobs use the host's `pg_dump`/`psql` |
+| A normal Linux user (e.g. `mohit`) | — | owns the crons; **not root** |
 
-Install / refresh them (idempotent):
-
-```bash
-./setup_cron.sh
-```
-
-macOS notes: Docker Desktop must be running (Settings -> "Start Docker
-Desktop when you sign in"), and because the repo is under `~/Desktop`,
-`/usr/sbin/cron` and your terminal need **Full Disk Access** (System
-Settings -> Privacy & Security), otherwise `crontab` fails with
-`Operation not permitted`.
-
----
-
-## Ubuntu server deployment (Docker)
-
-Runs the scraper in Docker on an Ubuntu server, against Postgres installed
-**on that same server**, scheduled with the server's crontab. Tested on a
-server that also runs other compose projects (e.g. the `company-intel` app).
-
-### How it works on Linux
-
-| Piece | What it does |
-|---|---|
-| `docker/cron.sh <job>` | Entry point for every job. On Linux it **always** runs `docker compose -f docker-compose.yml -f docker-compose.linux.yml`, so the container uses the **host network**. |
-| `docker-compose.linux.yml` | `network_mode: host`. `localhost` inside the container is the server itself, so Postgres sees a normal local connection. **No `pg_hba.conf` or `listen_addresses` changes needed.** |
-| `run_scrape.sh` | First checks the DB (10s timeout) and logs `✅ DB connected` or `❌ DB connection FAILED`. It aborts immediately on failure instead of after the 15-minute proxy refresh. |
-| Compose project `company-intel-scraper` | A unique project name, so it never shares containers or networks with other projects on the server. |
-| Fixed container names (`company-intel-scrape`, ...) | Overlap lock. A new run of a job is refused while the previous one is still running. |
-
-### Step 1 — Pre-flight checks
-
-Run these as the user that will own the crons (e.g. `mohit`), **not root**:
+### Step 1 — Install Docker and allow your user to use it
 
 ```bash
-docker compose version                  # needs v2.24+ (docker-compose.linux.yml uses !reset)
-docker ps                               # must work WITHOUT sudo
-id -nG | grep -w docker                 # user is in the docker group
-sudo systemctl is-enabled docker        # "enabled" = starts on boot
-psql --version && pg_dump --version     # client tools for backup/vacuum
-sudo systemctl is-active postgresql     # "active"
+sudo apt update
+sudo apt install -y ca-certificates curl git
+curl -fsSL https://get.docker.com | sudo sh     # Docker Engine + compose plugin
+sudo systemctl enable --now docker              # start now and on every boot
+sudo usermod -aG docker $USER                   # use docker without sudo
 ```
 
-| Check fails | Fix |
-|---|---|
-| `docker compose` missing / too old | `curl -fsSL https://get.docker.com \| sudo sh` |
-| `docker ps` → `permission denied` | `sudo usermod -aG docker $USER`, then **log out and back in** |
-| Docker not enabled | `sudo systemctl enable --now docker` |
-| `psql` / `pg_dump` missing | `sudo apt install -y postgresql-client` (same major version as the server, or newer) |
-| Postgres not installed | `sudo apt install -y postgresql postgresql-contrib` |
+**Log out and SSH back in**, because group changes only apply to new logins.
+Then check:
 
-### Step 2 — Database and user (skip if they exist)
+```bash
+docker compose version       # v2.24 or newer
+docker ps                    # must work WITHOUT sudo (no "permission denied")
+id -nG | grep -w docker      # prints "docker"
+systemctl is-enabled docker  # "enabled"
+```
+
+> **Issue seen:** `Cannot use Docker as user mohit ... permission denied while trying to connect to the docker API at unix:///var/run/docker.sock`.
+> The user wasn't in the `docker` group yet, or hadn't logged in again. Cron
+> runs as your user, so `sudo docker` isn't an option.
+
+### Step 2 — PostgreSQL: database, user and permissions
+
+Install Postgres if it isn't there already:
+
+```bash
+sudo apt install -y postgresql postgresql-contrib   # includes psql and pg_dump
+systemctl is-active postgresql                      # "active"
+psql --version && pg_dump --version
+```
+
+Create the database and user, skipping any that already exist:
 
 ```bash
 sudo -u postgres psql -c "CREATE USER company_intel_rw WITH PASSWORD 'CHANGE_ME';"
 sudo -u postgres psql -c "CREATE DATABASE company_intel OWNER company_intel_rw;"
-sudo -u postgres psql -d company_intel -c "GRANT USAGE, CREATE ON SCHEMA public TO company_intel_rw;"
 ```
 
-The scraper creates its tables on the first run. The `GRANT` is needed on
-PostgreSQL 15+, where ordinary users can't create objects in `public` by
-default. If the tables already exist and are owned by another role, see
-*DB permissions* in [Troubleshooting](#troubleshooting).
-
-### Step 3 — Get the code
+Grant the permissions the scraper needs. **This is required on PostgreSQL 15+.**
 
 ```bash
+sudo -u postgres psql -d company_intel <<'SQL'
+-- let the scraper create its tables/indexes in schema public
+GRANT USAGE, CREATE ON SCHEMA public TO company_intel_rw;
+
+-- if the scraper tables already exist (restored or created by another user),
+-- hand over ownership: db.py runs ALTER TABLE on every start, which only the owner may do
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['companies','news','jobs','products','job_locations'] LOOP
+    IF to_regclass('public.' || t) IS NOT NULL THEN
+      EXECUTE format('ALTER TABLE public.%I OWNER TO company_intel_rw', t);
+    END IF;
+  END LOOP;
+END $$;
+SQL
+```
+
+If the frontend (`company-intel` app) connects as a **different** DB user,
+let it read the scraper's tables:
+
+```bash
+sudo -u postgres psql -d company_intel -c "GRANT SELECT ON companies, news, jobs, products, job_locations TO <frontend_user>;"
+```
+
+Check, as the scraper user:
+
+```bash
+psql "postgresql://company_intel_rw:CHANGE_ME@localhost:5432/company_intel" -c "
+select has_schema_privilege('public','CREATE') as can_create,
+       (select string_agg(tablename||'='||tableowner, ', ') from pg_tables
+         where schemaname='public' and tablename in ('companies','news','jobs','products','job_locations')) as owners;"
+```
+
+`can_create` must be `t`, and every listed table must be `=company_intel_rw`.
+On a fresh DB the owners column is empty until the first scrape.
+
+> **Issue seen:** `psycopg.errors.InsufficientPrivilege: permission denied for schema public`.
+> PostgreSQL 15+ doesn't let ordinary users create objects in `public`.
+> Rollback: `REVOKE CREATE ON SCHEMA public FROM company_intel_rw;`, then
+> `ALTER TABLE <t> OWNER TO <previous owner>;`.
+
+### Step 3 — Get the code and create the state files
+
+```bash
+cd /var/www/html/pythonProjects          # or any folder you like
 git clone -b dockerSetup https://github.com/mohit255/company-intel-scraper.git
 cd company-intel-scraper
 mkdir -p logs backups
 touch proxies.txt proxies_working.txt proxies_failed.txt
 ```
 
-The `proxies*.txt` files are gitignored but are bind-mounted into the
-container. If they don't exist, Docker creates **directories** with those
-names and the proxy scripts break.
+The `proxies*.txt` files are gitignored but get mounted into the container.
+If they don't exist, Docker creates **directories** with those names and the
+proxy scripts break. `docker/cron.sh` also creates them, but create them now
+for manual runs.
 
 ### Step 4 — Configure `.env`
 
 ```bash
 cp .env.example .env
 nano .env
-chmod 600 .env
+chmod 600 .env        # readable only by you: it holds the DB password
 ```
 
 Complete server `.env`:
@@ -160,7 +184,7 @@ Complete server `.env`:
 # ── Database (local Postgres on this server) ─────────────────────────────────
 DATABASE_URL=postgresql://company_intel_rw:CHANGE_ME@localhost:5432/company_intel
 
-# ── Docker: Linux only (lets plain `docker compose ...` use host networking) ─
+# ── Docker: Linux only (manual `docker compose ...` commands use host network) ─
 COMPOSE_FILE=docker-compose.yml:docker-compose.linux.yml
 
 # ── Scraper tuning ───────────────────────────────────────────────────────────
@@ -178,19 +202,20 @@ PROXY_ROTATION=random
 MAX_PROXY_FAILURES=3
 ```
 
-| Variable | Server | Mac (Docker Desktop) | Notes |
-|---|---|---|---|
-| `DATABASE_URL` | host **`localhost`** | host **`localhost`** | The only place credentials come from. Don't use `172.17.0.1` or `host.docker.internal`. |
-| `COMPOSE_FILE` | set as above | **leave out** | `cron.sh` already loads the Linux file by itself. This line makes manual `docker compose run ...` commands use it too. |
-| `SCRAPER_*`, `PROXY_*` | optional | optional | Defaults are in [Environment variables](#environment-variables). |
+| Variable | What to set | Notes |
+|---|---|---|
+| `DATABASE_URL` | host **`localhost`** | The only place credentials come from. **Don't** use `172.17.0.1` or `host.docker.internal`. |
+| `COMPOSE_FILE` | `docker-compose.yml:docker-compose.linux.yml` | Linux only. `cron.sh` adds the Linux file itself; this line makes manual `docker compose run ...` commands behave the same. **Leave it out on macOS.** |
+| `SCRAPER_*` | optional | Defaults are in [Environment variables](#environment-variables) |
+| `PROXY_*` | optional | Without `PROXY_FILE` there's no proxy refresh, so the first run is about 15 minutes faster |
 
-`.env` rules:
+`.env` formatting rules. Breaking these causes silent misconfiguration:
 - No comments after a value on the same line; put them on their own line.
 - No quotes, and no spaces around `=`.
-- URL-encode special characters in the password (`@` → `%40`, `#` → `%23`, `/` → `%2F`).
-- Use Unix line endings. If the file was edited on Windows, run `sed -i 's/\r$//' .env`.
+- URL-encode special characters in the password: `@` → `%40`, `#` → `%23`, `/` → `%2F`, `:` → `%3A`.
+- Use Unix line endings. Check with `grep -c $'\r' .env` (should print `0`) and fix with `sed -i 's/\r$//' .env`.
 
-### Step 5 — Verify the config before running
+### Step 5 — Verify the config before the first run
 
 ```bash
 docker compose config | grep -E '^name:|network_mode|DB_HOST_OVERRIDE'
@@ -204,71 +229,105 @@ name: company-intel-scraper
     network_mode: host
 ```
 
-Then test the DB connection from inside the container (takes about 5s):
+Test the DB connection from inside a container (about 5 seconds):
 
 ```bash
 docker compose run --rm scraper python -c "import os,psycopg; psycopg.connect(os.environ['DATABASE_URL'], connect_timeout=5); print('DB OK')"
 ```
 
+> **Issue seen:** `no pg_hba.conf entry for host "172.19.0.2"` / `"172.20.0.2"`.
+> The container was on Docker's bridge network, so it reached Postgres from
+> a `172.x` address that `pg_hba.conf` rejects. `docker-compose.linux.yml`
+> wasn't being loaded, and the compose project name also clashed with the
+> `company-intel` app. Both are fixed: the project has its own name and
+> `cron.sh` always loads the Linux file.
+
 ### Step 6 — (Optional) Restore existing data
 
-```bash
-gunzip -c company_intel_YYYYMMDD.sql.gz | psql "$(grep ^DATABASE_URL= .env | cut -d= -f2-)"
-```
-
-### Step 7 — Build and first run
+Copy a backup from another machine (e.g. `scp backups/company_intel_YYYYMMDD.sql.gz mohit@server:~/`), then:
 
 ```bash
-docker compose build                 # build the scraper image
-docker/cron.sh scrape &              # same job cron runs hourly; output goes to the log
-sleep 15; grep -E "Compose:|DB connected|DB connection FAILED" logs/cron-scrape.log | tail -2
-tail -f logs/cron-scrape.log | grep --line-buffered -v "❌\|✅"   # follow progress, Ctrl+C to stop watching
+gunzip -c ~/company_intel_YYYYMMDD.sql.gz | psql "$(grep ^DATABASE_URL= .env | cut -d= -f2-)"
 ```
 
-`docker/cron.sh` prints nothing to the terminal; everything goes to
-`logs/cron-<job>.log`. A first run takes about 6–20 minutes, because it
-refreshes the proxy pool when there are fewer than 50 proxies.
+If the tables end up owned by a different role, **re-run the ownership block
+from Step 2**. Skip this step to start empty; the first scrape creates the tables.
 
-A healthy run logs:
+### Step 7 — Build the image
+
+```bash
+docker compose build
+```
+
+Rebuild after any `git pull` that changes `*.py`, `run_scrape.sh`,
+`requirements.txt` or `Dockerfile`, because those are baked into the image.
+
+### Step 8 — First run
+
+```bash
+docker rm -f company-intel-scrape 2>/dev/null      # clear any old failed run
+docker/cron.sh scrape &                            # the same job cron runs hourly
+sleep 15; grep -E "Compose:|DB connected|DB permissions|DB connection FAILED" logs/cron-scrape.log | tail -3
+```
+
+Within 15 seconds you should see:
 
 ```
-===== [scrape] start 2026-09-24 21:00:01 =====
 Compose: docker compose -f docker-compose.yml -f docker-compose.linux.yml
 ✅ DB connected: localhost:5432/company_intel as company_intel_rw (PostgreSQL 16.x)
 ✅ DB permissions OK (CREATE on public, owns scraper tables)
-...
+```
+
+Follow progress without the per-proxy ✅/❌ lines:
+
+```bash
+tail -f logs/cron-scrape.log | grep --line-buffered -v "❌ http\|✅ http"
+```
+
+Press `Ctrl+C` to stop watching; the job keeps running. A first run takes
+about **6–20 minutes**. When `proxies.txt` has fewer than 50 entries it first
+tests about 3,000 public proxies, which alone takes about 15 minutes. Finished means:
+
+```
 Database Summary:
   Companies: 213
-...
+  ...
 1721 jobs -> 2202 location rows (...)
-===== [scrape] end 2026-09-24 21:20:45 rc=0 =====
+===== [scrape] end 2026-09-25 01:35:12 rc=0 =====
 ```
 
-### Step 8 — Install the cron jobs
+> **Issue seen:** "`docker/cron.sh scrape` is stuck". It isn't; all output
+> goes to `logs/cron-scrape.log`, not the terminal. Watch the log, or use
+> `docker logs -f --tail 50 company-intel-scrape`. Note that `--tail` needs a
+> number, so `docker logs --tail -f` fails.
+
+### Step 9 — Install the cron jobs
 
 ```bash
-./setup_cron.sh        # idempotent; replaces its own block in the crontab
-crontab -l | grep cron.sh
+./setup_cron.sh              # idempotent; replaces only its own block in the crontab
+crontab -l | grep cron.sh    # 5 lines
 ```
 
-This installs the 5 jobs from [Docker cron jobs](#docker-cron-jobs). Run it as
-your normal user, **not** with `sudo`. Otherwise the jobs land in root's
-crontab and create root-owned files.
+Run it as your normal user, **not with `sudo`**. Otherwise the jobs go into
+root's crontab and create root-owned files. See [Docker cron jobs](#docker-cron-jobs)
+for the schedule.
 
-### Step 9 — Test backup and vacuum once
+### Step 10 — Test backup and vacuum once
 
 ```bash
-docker/cron.sh backup && ls -lh backups/        # company_intel_YYYYMMDD.sql.gz
-docker/cron.sh vacuum && tail -3 logs/cron-vacuum.log
+docker/cron.sh backup && ls -lh backups/           # company_intel_YYYYMMDD.sql.gz
+docker/cron.sh vacuum && tail -3 logs/cron-vacuum.log   # "VACUUM", rc=0
 ```
 
-### Step 10 — Log rotation (recommended)
+These run on the host with its own `pg_dump`/`psql`, using `DATABASE_URL` from `.env`.
 
-`logs/cron-*.log` files grow forever. Create `/etc/logrotate.d/company-scraper`
-(adjust the path):
+### Step 11 — Log rotation
 
-```
-/var/www/html/pythonProjects/company-intel-scraper/logs/*.log {
+`logs/cron-*.log` grows with every run. Create `/etc/logrotate.d/company-scraper`:
+
+```bash
+sudo tee /etc/logrotate.d/company-scraper >/dev/null <<EOF
+$(pwd)/logs/*.log {
     daily
     rotate 7
     compress
@@ -276,56 +335,139 @@ docker/cron.sh vacuum && tail -3 logs/cron-vacuum.log
     notifempty
     copytruncate
 }
+EOF
+sudo logrotate -d /etc/logrotate.d/company-scraper     # dry run: check for errors
 ```
 
-`copytruncate` is needed because the files are held open by `>>` appends.
+`copytruncate` is needed because the logs are appended to with `>>`.
+
+### Step 12 — Confirm cron runs it by itself
+
+After the next full hour:
+
+```bash
+grep "\[scrape\] start" logs/cron-scrape.log | tail -3   # a start at HH:00:0x that you didn't trigger
+grep CRON /var/log/syslog | tail -5                      # CMD (.../docker/cron.sh scrape)
+```
+
+---
+
+### Docker cron jobs
+
+Installed by `./setup_cron.sh`. Each job logs to `logs/cron-<job>.log`.
+
+| Schedule | Job | Runs | Where |
+|---|---|---|---|
+| `0 * * * *` (hourly) | `scrape` | `run_scrape.sh` + `enrich_locations.py` | container `company-intel-scrape` |
+| `30 */6 * * *` | `proxies` | `fetch_fresh_proxies.py` | container `company-intel-proxies` |
+| `0 2 * * 0` (Sun) | `clean-proxies` | `test_and_clean_proxies.py` | container `company-intel-clean-proxies` |
+| `0 1 * * *` (daily) | `backup` | `pg_dump` to `backups/*.sql.gz`, keeps 30 days | host |
+| `0 5 * * 0` (Sun) | `vacuum` | `VACUUM ANALYZE` | host |
+
+Run any job by hand with `docker/cron.sh <job>`. While a job's container is
+running, starting it again fails with a name conflict. This is deliberate:
+it stops runs piling up.
+
+---
+
+## Daily operations
 
 ### Health checks
 
 | What | Command | Healthy |
 |---|---|---|
-| Last scrape runs | `grep "\[scrape\] end" logs/cron-scrape.log \| tail -5` | every line ends with `rc=0` |
-| Cron fired on schedule | `grep "\[scrape\] start" logs/cron-scrape.log \| tail -3` | times at `HH:00` |
-| DB reachable | `grep -E "DB connected\|DB connection FAILED" logs/cron-scrape.log \| tail -1` | `✅ DB connected` |
-| Job running now | `docker ps --format '{{.Names}}  {{.Status}}' \| grep company-intel-` | `Up N minutes` during a run |
+| Recent scrapes | `grep "\[scrape\] end" logs/cron-scrape.log \| tail -5` | every line ends with `rc=0` |
+| Cron firing | `grep "\[scrape\] start" logs/cron-scrape.log \| tail -3` | times at `HH:00` |
+| DB status | `grep -E "DB connected\|DB permissions\|DB connection FAILED" logs/cron-scrape.log \| tail -2` | both `✅` |
+| Running now | `docker ps --format '{{.Names}}  {{.Status}}' \| grep company-intel-` | `Up N minutes` during a run |
 | Live output | `docker logs -f --tail 50 company-intel-scrape` | progress lines |
 | Crons installed | `crontab -l \| grep cron.sh` | 5 lines |
-| Backups | `ls -lh backups/` | a file for each day |
-| Cron daemon | `grep CRON /var/log/syslog \| tail -5` | `CMD (.../docker/cron.sh ...)` |
+| Backups | `ls -lh backups/` | one file per day |
+| Data | `psql "$(grep ^DATABASE_URL= .env \| cut -d= -f2-)" -c "select count(*) from news;"` | growing |
 
 ### Updating the code
 
 ```bash
 git pull
-docker compose build     # needed when anything copied into the image changed (*.py, run_scrape.sh, requirements.txt)
-./setup_cron.sh          # only if the schedule in setup_cron.sh changed
+docker compose build     # when *.py, run_scrape.sh, requirements.txt or Dockerfile changed
+./setup_cron.sh          # only when setup_cron.sh (the schedule) changed
 ```
 
-| Changed file | Rebuild needed? |
+| Changed file | Action |
 |---|---|
-| `*.py`, `run_scrape.sh`, `requirements.txt`, `Dockerfile` | **Yes**: `docker compose build` |
-| `docker/cron.sh`, `docker-compose*.yml`, `companies.json`, `.env` | No; used from the host or mounted |
-| `setup_cron.sh` | No, but re-run `./setup_cron.sh` |
+| `*.py`, `run_scrape.sh`, `requirements.txt`, `Dockerfile` | `docker compose build` |
+| `docker/cron.sh`, `docker-compose*.yml`, `companies.json`, `.env` | nothing; these are read from the host |
+| `setup_cron.sh` | `./setup_cron.sh` |
 
-### Troubleshooting
+### Stopping a run
 
-| Symptom (in `logs/cron-scrape.log`) | Cause → Fix |
-|---|---|
-| `Cannot use Docker as user X ... permission denied` | User not in the `docker` group → `sudo usermod -aG docker X`, then log out and back in. Check with `docker ps`. |
-| `Cannot use Docker ... Is the docker daemon running?` | Docker stopped → `sudo systemctl enable --now docker` |
-| `❌ DB connection FAILED: ... no pg_hba.conf entry for host "172.x.x.x"` | Container is on a bridge network, not the host network. Check the `Compose:` log line includes `docker-compose.linux.yml`, `DATABASE_URL` uses `localhost`, and `docker compose config` shows `network_mode: host`. |
-| `❌ DB permissions: ... has no CREATE on schema public` / `does not own: ...` (or `InsufficientPrivilege: permission denied for schema public`) | PostgreSQL 15+ doesn't give ordinary users `CREATE` on `public`, and `db.py` runs `CREATE`/`ALTER TABLE` on every start, so the user must own the scraper tables. As postgres: `GRANT USAGE, CREATE ON SCHEMA public TO company_intel_rw;` then `ALTER TABLE <t> OWNER TO company_intel_rw;` for `companies`, `news`, `jobs`, `products`, `job_locations`. If the frontend uses another DB user, `GRANT SELECT` on those tables to it. |
-| `❌ DB connection FAILED: ... password authentication failed` | Wrong user or password in `DATABASE_URL`, or unencoded special characters in the password |
-| `❌ DB connection FAILED: ... Connection refused` | Postgres not running → `sudo systemctl status postgresql` |
-| `Conflict. The container name "/company-intel-scrape" is already in use` | The previous run is still going (overlap protection, expected). If it's stuck: `docker rm -f company-intel-scrape` |
-| Terminal looks "stuck" after `docker/cron.sh scrape` | Normal: output goes to the log file. Watch with `tail -f logs/cron-scrape.log`. |
-| Old behaviour after `git pull` | Image not rebuilt → `docker compose build` |
-| `pg_dump: server version mismatch` | Install `postgresql-client-<server major>` |
-| `docker logs --tail -f ...` error | `--tail` needs a number: `docker logs -f --tail 50 <container>` |
+```bash
+docker rm -f company-intel-scrape      # kills the run and frees the name for the next one
+```
+
+### Removing everything
+
+```bash
+crontab -l | sed '/# BEGIN company-intel-scraper/,/# END company-intel-scraper/d' | crontab -
+docker rm -f company-intel-scrape company-intel-proxies company-intel-clean-proxies 2>/dev/null
+docker rmi company-intel-scraper:latest
+```
+
+This leaves the database, `logs/` and `backups/` untouched.
 
 ---
 
-## Bare-metal setup (step by step)
+## Troubleshooting
+
+These are all the issues seen while setting this up on a server, in the order
+they came up. Start with the first `❌` or error line in `logs/cron-<job>.log`.
+
+| # | Symptom | Cause | Fix |
+|---|---|---|---|
+| 1 | `sudo docker run --env-file .env company-scraper` can't reach the DB | In a container on the default network, `localhost` is the container itself | Don't use plain `docker run`. Use `docker/cron.sh scrape` or `docker compose run --rm scraper`. |
+| 2 | `Cannot use Docker as user X ... permission denied ... docker.sock` | User not in the `docker` group, or no re-login since being added | `sudo usermod -aG docker X`, log out and back in, check `docker ps` |
+| 3 | `Cannot use Docker ... Is the docker daemon running?` | Docker service stopped | `sudo systemctl enable --now docker` |
+| 4 | `docker/cron.sh scrape` looks stuck | Output goes to the log file, not the terminal; proxy refresh takes about 15 min | `tail -f logs/cron-scrape.log` |
+| 5 | `docker logs --tail -f <id>` error | `--tail` needs a number | `docker logs -f --tail 50 <id>` |
+| 6 | `❌ DB connection FAILED: ... no pg_hba.conf entry for host "172.x.x.x"` | Container on a bridge network instead of the host network | Check the `Compose:` log line includes `docker-compose.linux.yml`, `DATABASE_URL` uses `localhost`, and `docker compose config` shows `network_mode: host`. `git pull` for the `cron.sh` fix. |
+| 7 | Same as #6, but the address changes (`172.19` → `172.20`) after a fix | The compose project name clashed with another project (`company-intel`) | Fixed: the project is now `company-intel-scraper`. `git pull`. |
+| 8 | A fix to `.env` made no difference | The running container was created before the change; `.env` is read when a container starts | `docker rm -f company-intel-scrape`, then run again |
+| 9 | Code fix made no difference after `git pull` | Image not rebuilt | `docker compose build` |
+| 10 | `❌ DB permissions: ... has no CREATE on schema public` / `InsufficientPrivilege: permission denied for schema public` | PostgreSQL 15+ doesn't give `CREATE` on `public` | Step 2 `GRANT USAGE, CREATE ON SCHEMA public TO company_intel_rw;` |
+| 11 | `❌ DB permissions: ... does not own: companies, news, ...` | Tables were created or restored by another role; `db.py` runs `ALTER TABLE`, which only the owner may do | Step 2 ownership `DO $$ ... $$` block |
+| 12 | `❌ DB connection FAILED: ... password authentication failed` | Wrong user or password, or unencoded special characters in the password | Fix `DATABASE_URL`; URL-encode `@ # / :` |
+| 13 | `❌ DB connection FAILED: ... Connection refused` | Postgres not running, or not on port 5432 | `sudo systemctl status postgresql`; `sudo -u postgres psql -c 'show port'` |
+| 14 | `Conflict. The container name "/company-intel-scrape" is already in use` | The previous run is still going (overlap lock) | Expected. If it's really stuck: `docker rm -f company-intel-scrape` |
+| 15 | `pg_dump: error: server version mismatch` | Host `pg_dump` older than the server | `sudo apt install -y postgresql-client-<server major>` |
+| 16 | Proxy files show up as directories | `proxies*.txt` didn't exist when the container first started | `rm -rf proxies*.txt && touch proxies.txt proxies_working.txt proxies_failed.txt` |
+| 17 | `.env` values ignored or wrong | Windows line endings, quotes, or comments after values | `sed -i 's/\r$//' .env`; follow the Step 4 formatting rules |
+
+---
+
+## Local development on macOS (Docker Desktop)
+
+The same setup works on a Mac against the Mac's local Postgres, with these differences:
+
+- Leave `COMPOSE_FILE` **out** of `.env`. Docker Desktop reaches the host through
+  `host.docker.internal`, which `docker-entrypoint.sh` substitutes for `localhost`.
+- Docker Desktop must be running: Settings → General → "Start Docker Desktop when you sign in".
+- For cron: if the repo is under `~/Desktop` or `~/Documents`, grant **Full Disk Access**
+  to your terminal/IDE and to `/usr/sbin/cron` (System Settings → Privacy & Security).
+  Otherwise `crontab` fails with `Operation not permitted`.
+
+```bash
+cp .env.example .env                 # DATABASE_URL=postgresql://user:pass@localhost:5432/company_intel
+touch proxies.txt proxies_working.txt proxies_failed.txt
+docker compose build
+docker compose run --rm scraper      # full run_scrape.sh, output in the terminal
+./setup_cron.sh                      # optional: same cron jobs as the server
+```
+
+---
+
+## Bare-metal setup (without Docker)
+
+Runs the scraper directly with a Python venv. Use this only if you can't use Docker.
 
 ### Step 1 — System dependencies
 
@@ -383,6 +525,8 @@ Inside `psql`:
 ```sql
 CREATE USER scraper WITH PASSWORD 'changeme';
 CREATE DATABASE company_intel OWNER scraper;
+\c company_intel
+GRANT USAGE, CREATE ON SCHEMA public TO scraper;   -- required on PostgreSQL 15+
 \q
 ```
 
