@@ -313,6 +313,7 @@ class CompanyScraper:
         self.config = config
         self.storage = CompanyStorage()
         self.proxy_manager = None
+        self.proxy_url = None
         
         if config.proxies:
             self.proxy_manager = ProxyManager(
@@ -346,46 +347,49 @@ class CompanyScraper:
         
         return str(proxy)
     
-    def _mark_proxy_success(self, proxy_str: Optional[str]):
-        if self.proxy_manager and proxy_str:
-            self.proxy_manager.mark_success(proxy_str)
-
-    def _mark_proxy_failure(self, proxy_str: Optional[str]):
-        if self.proxy_manager and proxy_str:
-            self.proxy_manager.mark_failure(proxy_str)
-
-    # Proxies to try per URL before falling back to a direct request. Free
-    # proxies often time out, reset connections, or intercept TLS with their
-    # own certificate (CERTIFICATE_VERIFY_FAILED), so one bad pick must not
-    # lose the fetch.
-    PROXY_ATTEMPTS = 3
-    # Statuses that usually mean the proxy (not the URL) is the problem
-    RETRYABLE_STATUS = {403, 407, 429, 500, 502, 503, 504}
-
+    def _mark_proxy_success(self):
+        if self.proxy_manager and self.proxy_url:
+            if isinstance(self.proxy_url, dict):
+                proxy_str = self.proxy_url.get('http') or self.proxy_url.get('https')
+            else:
+                proxy_str = self.proxy_url
+            if proxy_str:
+                self.proxy_manager.mark_success(proxy_str)
+    
+    def _mark_proxy_failure(self):
+        if self.proxy_manager and self.proxy_url:
+            if isinstance(self.proxy_url, dict):
+                proxy_str = self.proxy_url.get('http') or self.proxy_url.get('https')
+            else:
+                proxy_str = self.proxy_url
+            if proxy_str:
+                self.proxy_manager.mark_failure(proxy_str)
+    
     async def fetch_url(self, url: str, headers: Dict = None) -> Optional[str]:
-        # The proxy is kept local (not on self) because workers run
-        # concurrently and would otherwise mark each other's proxies.
-        attempts = [self._get_proxy() for _ in range(self.PROXY_ATTEMPTS)] if self.proxy_manager else []
-        attempts = [p for p in attempts if p] + [None]  # None = direct
-
-        await asyncio.sleep(self.config.delay)
-        last_error = None
-        for proxy_str in attempts:
-            try:
-                async with self.session.get(url, proxy=proxy_str, timeout=self.config.timeout) as resp:
-                    if resp.status == 200:
-                        self._mark_proxy_success(proxy_str)
-                        return await resp.text()
-                    last_error = f"HTTP {resp.status}"
-                    if resp.status not in self.RETRYABLE_STATUS:
-                        break
-                    self._mark_proxy_failure(proxy_str)
-            except Exception as e:
-                self._mark_proxy_failure(proxy_str)
-                last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-
-        print(f"  Error fetching {url} ({len(attempts)} attempts): {last_error}")
-        return None
+        self.proxy_url = self._get_proxy()
+        
+        proxy_str = None
+        if self.proxy_url:
+            if isinstance(self.proxy_url, dict):
+                proxy_str = self.proxy_url.get('http') or self.proxy_url.get('https')
+            elif isinstance(self.proxy_url, str):
+                proxy_str = self.proxy_url
+        
+        try:
+            await asyncio.sleep(self.config.delay)
+            
+            async with self.session.get(url, proxy=proxy_str, timeout=self.config.timeout) as resp:
+                if resp.status == 200:
+                    self._mark_proxy_success()
+                    return await resp.text()
+                else:
+                    self._mark_proxy_failure()
+                    print(f"  HTTP {resp.status} for {url}")
+                    return None
+        except Exception as e:
+            self._mark_proxy_failure()
+            print(f"  Error fetching {url}: {e}")
+            return None
     
     async def scrape_news(self, company: Dict) -> List[Dict]:
         news_items = []
