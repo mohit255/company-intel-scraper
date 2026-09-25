@@ -215,8 +215,7 @@ class CompanyStorage:
     def __init__(self):
         self.conn = connect()
         init_db(self.conn)
-        # Mask the password so it never lands in logs
-        print(f"Connected to PostgreSQL: {re.sub(r'://([^:/@]+):[^@]*@', r'://\1:***@', DB_URL)}")
+        print(f"Connected to PostgreSQL: {DB_URL}")
     
     def save_news(self, company: str, field: str, title: str, link: str, 
                   source: str = None, published: str = None, topic: str = 'general'):

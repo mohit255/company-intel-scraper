@@ -90,9 +90,7 @@ def main():
             test_proxies = {'http': proxy, 'https': proxy}
             start_time = time.time()
             response = requests.get(
-                # Test against a real target: some proxies pass httpbin but
-                # intercept Google TLS (CERTIFICATE_VERIFY_FAILED in the scraper)
-                'https://news.google.com/rss/search?q=test&hl=en-US&gl=US&ceid=US:en',
+                'https://httpbin.org/ip',
                 proxies=test_proxies,
                 timeout=5
             )
