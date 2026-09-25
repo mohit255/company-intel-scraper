@@ -125,9 +125,13 @@ sudo systemctl is-active postgresql     # "active"
 ```bash
 sudo -u postgres psql -c "CREATE USER company_intel_rw WITH PASSWORD 'CHANGE_ME';"
 sudo -u postgres psql -c "CREATE DATABASE company_intel OWNER company_intel_rw;"
+sudo -u postgres psql -d company_intel -c "GRANT USAGE, CREATE ON SCHEMA public TO company_intel_rw;"
 ```
 
-The scraper creates its tables on the first run.
+The scraper creates its tables on the first run. The `GRANT` is needed on
+PostgreSQL 15+, where ordinary users can't create objects in `public` by
+default. If the tables already exist and are owned by another role, see
+*DB permissions* in [Troubleshooting](#troubleshooting).
 
 ### Step 3 — Get the code
 
@@ -231,6 +235,7 @@ A healthy run logs:
 ===== [scrape] start 2026-09-24 21:00:01 =====
 Compose: docker compose -f docker-compose.yml -f docker-compose.linux.yml
 ✅ DB connected: localhost:5432/company_intel as company_intel_rw (PostgreSQL 16.x)
+✅ DB permissions OK (CREATE on public, owns scraper tables)
 ...
 Database Summary:
   Companies: 213
@@ -309,6 +314,7 @@ docker compose build     # needed when anything copied into the image changed (*
 | `Cannot use Docker as user X ... permission denied` | User not in the `docker` group → `sudo usermod -aG docker X`, then log out and back in. Check with `docker ps`. |
 | `Cannot use Docker ... Is the docker daemon running?` | Docker stopped → `sudo systemctl enable --now docker` |
 | `❌ DB connection FAILED: ... no pg_hba.conf entry for host "172.x.x.x"` | Container is on a bridge network, not the host network. Check the `Compose:` log line includes `docker-compose.linux.yml`, `DATABASE_URL` uses `localhost`, and `docker compose config` shows `network_mode: host`. |
+| `❌ DB permissions: ... has no CREATE on schema public` / `does not own: ...` (or `InsufficientPrivilege: permission denied for schema public`) | PostgreSQL 15+ doesn't give ordinary users `CREATE` on `public`, and `db.py` runs `CREATE`/`ALTER TABLE` on every start, so the user must own the scraper tables. As postgres: `GRANT USAGE, CREATE ON SCHEMA public TO company_intel_rw;` then `ALTER TABLE <t> OWNER TO company_intel_rw;` for `companies`, `news`, `jobs`, `products`, `job_locations`. If the frontend uses another DB user, `GRANT SELECT` on those tables to it. |
 | `❌ DB connection FAILED: ... password authentication failed` | Wrong user or password in `DATABASE_URL`, or unencoded special characters in the password |
 | `❌ DB connection FAILED: ... Connection refused` | Postgres not running → `sudo systemctl status postgresql` |
 | `Conflict. The container name "/company-intel-scrape" is already in use` | The previous run is still going (overlap protection, expected). If it's stuck: `docker rm -f company-intel-scrape` |

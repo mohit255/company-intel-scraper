@@ -38,7 +38,7 @@ echo "Companies file: $COMPANIES_FILE"
 echo ""
 
 # Fail fast if the database is unreachable (before the slow proxy refresh)
-$PYTHON - <<'PYEOF' || { echo "=== scrape aborted: database unreachable ==="; exit 1; }
+$PYTHON - <<'PYEOF' || { echo "=== scrape aborted: database check failed ==="; exit 1; }
 import os, sys, psycopg
 url = os.environ["DATABASE_URL"]
 try:
@@ -46,6 +46,24 @@ try:
         info = conn.info
         ver = conn.execute("SHOW server_version").fetchone()[0]
         print(f"✅ DB connected: {info.host}:{info.port}/{info.dbname} as {info.user} (PostgreSQL {ver})")
+        # db.py runs CREATE TABLE/INDEX and ALTER TABLE on startup: needs CREATE
+        # on schema public and ownership of the scraper's tables.
+        can_create = conn.execute("SELECT has_schema_privilege('public', 'CREATE')").fetchone()[0]
+        not_owned = [r[0] for r in conn.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
+            "AND tablename IN ('companies','news','jobs','products','job_locations') "
+            "AND tableowner <> current_user ORDER BY 1").fetchall()]
+        if not can_create or not_owned:
+            if not can_create:
+                print(f"❌ DB permissions: {info.user} has no CREATE on schema public")
+            if not_owned:
+                print(f"❌ DB permissions: {info.user} does not own: {', '.join(not_owned)}")
+            print(f"   Fix (as postgres): GRANT USAGE, CREATE ON SCHEMA public TO {info.user}; "
+                  f"ALTER TABLE <table> OWNER TO {info.user};  (see README Troubleshooting)")
+            sys.exit(1)
+        print(f"✅ DB permissions OK (CREATE on public, owns scraper tables)")
+except SystemExit:
+    raise
 except Exception as e:
     print(f"❌ DB connection FAILED: {str(e).strip()}")
     if "pg_hba.conf" in str(e):
