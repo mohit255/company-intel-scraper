@@ -14,7 +14,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any, Set, Tuple
-from urllib.parse import urljoin, urldefrag, urlparse
+from urllib.parse import quote, urljoin, urldefrag, urlparse
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -100,6 +100,33 @@ except ImportError:
             return proxies
 
 USER_AGENT = "Mozilla/5.0 (compatible; CompanyIntelScraper/1.0)"
+
+# Market / IPO news sources, saved with topic='market', field='Markets' and
+# the source name as company, so the site can filter them. Sites with a
+# working RSS feed are read directly; sites that block bots (Moneycontrol,
+# BSE, NSE, INDmoney, Business Standard, Financial Express: 403/timeout) or
+# have no feed (Groww) are covered by a Google News search for that site.
+# Names must not clash with companies.json (e.g. "Zerodha", "Groww").
+MARKET_FEEDS = [
+    {"name": "Economic Times Markets", "url": "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"},
+    {"name": "Economic Times Stocks",  "url": "https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms"},
+    {"name": "Economic Times IPO",     "url": "https://economictimes.indiatimes.com/markets/ipos/fpos/rssfeeds/14655708.cms"},
+    {"name": "Times of India Business", "url": "https://timesofindia.indiatimes.com/rssfeeds/1898055.cms"},
+    {"name": "Mint Markets",           "url": "https://www.livemint.com/rss/markets"},
+    {"name": "BusinessLine Markets",   "url": "https://www.thehindubusinessline.com/markets/feeder/default.rss"},
+    {"name": "NDTV Profit",            "url": "https://feeds.feedburner.com/ndtvprofit-latest"},
+    {"name": "CNBC-TV18 Market",       "url": "https://www.cnbctv18.com/commonfeeds/v1/cne/rss/market.xml"},
+    {"name": "Zerodha Pulse",          "url": "https://pulse.zerodha.com/feed.php"},
+    {"name": "Zerodha Z-Connect",      "url": "https://zerodha.com/z-connect/feed"},  # Kite / Zerodha updates
+    {"name": "Moneycontrol",           "query": "site:moneycontrol.com/news when:2d"},
+    {"name": "Business Standard Markets", "query": "site:business-standard.com/markets when:2d"},
+    {"name": "Financial Express Market",  "query": "site:financialexpress.com/market when:2d"},
+    {"name": "Groww Blog",             "query": "site:groww.in/blog when:7d"},
+    {"name": "INDmoney Blog",          "query": "site:indmoney.com/blog when:7d"},
+    # bseindia.com / nseindia.com only surface quote pages, so search news about them
+    {"name": "BSE Sensex News",        "query": '"BSE" (Sensex OR "BSE-listed" OR "BSE filing") when:2d'},
+    {"name": "NSE Nifty News",         "query": '"NSE" (Nifty OR "NSE-listed" OR circular) when:2d'},
+]
 
 
 class DomainThrottle:
@@ -188,6 +215,7 @@ class Config:
     max_news_per_company: int = 15
     max_jobs_per_company: int = 15
     max_products_per_company: int = 10
+    max_market_news: int = 50  # per market feed; 0 disables market feeds
     delay: float = 1.0
     timeout: float = 30.0
     respect_robots: bool = True
@@ -327,6 +355,7 @@ class CompanyScraper:
         self.total_news = 0
         self.total_jobs = 0
         self.total_products = 0
+        self.total_market_news = 0
         self.errors = 0
     
     def _get_proxy(self):
@@ -389,6 +418,58 @@ class CompanyScraper:
         self.errors += 1
         return None
     
+    def _save_rss_items(self, xml: str, name: str, field: str, topic: str,
+                        limit: int) -> List[Dict]:
+        """Save RSS <item>s newer than what's already stored for `name`."""
+        saved = []
+        latest_known = _as_aware_utc(self.storage.get_latest_news_date(name))
+        soup = BeautifulSoup(xml, 'xml')
+        for item in soup.find_all('item')[:limit]:
+            title = item.title.text.strip() if item.title else ''
+            link = item.link.text.strip() if item.link else ''
+            pub_date_raw = item.pubDate.text if item.pubDate else ''
+            source = item.source.text if item.source else ''
+
+            if not (title and link):
+                continue
+
+            # Skip anything not newer than what we already have — avoids
+            # re-processing the same old matches on every run.
+            pub_date = _as_aware_utc(parse_rss_date(pub_date_raw))
+            if latest_known and pub_date and pub_date <= latest_known:
+                continue
+
+            self.storage.save_news(
+                company=name,
+                field=field,
+                title=title,
+                link=link,
+                source=source or name,
+                published=pub_date_raw,
+                topic=topic
+            )
+            saved.append({'title': title, 'link': link})
+        return saved
+    
+    async def scrape_market_feed(self, feed: Dict) -> int:
+        name = feed['name']
+        url = feed.get('url') or (
+            f"https://news.google.com/rss/search?q={quote(feed['query'])}"
+            "&hl=en-IN&gl=IN&ceid=IN:en")
+        xml = await self.fetch_url(url)
+        if not xml:
+            return 0
+        try:
+            items = self._save_rss_items(xml, name, 'Markets', 'market',
+                                         self.config.max_market_news)
+        except Exception as e:
+            print(f"  Error parsing {name} feed: {e}")
+            self.errors += 1
+            return 0
+        print(f"  Market feed {name}: {len(items)} new articles")
+        self.total_market_news += len(items)
+        return len(items)
+    
     async def scrape_news(self, company: Dict) -> List[Dict]:
         news_items = []
         company_name = company['name']
@@ -401,38 +482,9 @@ class CompanyScraper:
         if not html:
             return news_items
 
-        latest_known = _as_aware_utc(self.storage.get_latest_news_date(company_name))
-
         try:
-            soup = BeautifulSoup(html, 'xml')
-            items = soup.find_all('item')[:self.config.max_news_per_company]
-
-            for item in items:
-                title = item.title.text if item.title else ''
-                link = item.link.text if item.link else ''
-                pub_date_raw = item.pubDate.text if item.pubDate else ''
-                source = item.source.text if item.source else ''
-
-                if not (title and link):
-                    continue
-
-                # Skip anything not newer than what we already have for this
-                # company — avoids re-processing the same old search matches
-                # on every run.
-                pub_date = _as_aware_utc(parse_rss_date(pub_date_raw))
-                if latest_known and pub_date and pub_date <= latest_known:
-                    continue
-
-                self.storage.save_news(
-                    company=company_name,
-                    field=field,
-                    title=title,
-                    link=link,
-                    source=source,
-                    published=pub_date_raw,
-                    topic='general'
-                )
-                news_items.append({'title': title, 'link': link})
+            news_items = self._save_rss_items(
+                html, company_name, field, 'general', self.config.max_news_per_company)
         except Exception as e:
             print(f"  Error parsing news RSS: {e}")
             self.errors += 1
@@ -665,6 +717,16 @@ class CompanyScraper:
             
             tasks = [process_company(company) for company in companies]
             results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            if self.config.max_market_news > 0:
+                print(f"\nScraping {len(MARKET_FEEDS)} market news feeds...")
+                
+                async def process_feed(feed):
+                    async with semaphore:
+                        return await self.scrape_market_feed(feed)
+                
+                await asyncio.gather(*(process_feed(f) for f in MARKET_FEEDS),
+                                     return_exceptions=True)
         
         elapsed = time.time() - start_time
         
@@ -673,6 +735,7 @@ class CompanyScraper:
         print(f"{'='*60}")
         print(f"Companies processed: {len(companies)}")
         print(f"Total news scraped: {self.total_news}")
+        print(f"Total market news scraped: {self.total_market_news}")
         print(f"Total jobs scraped: {self.total_jobs}")
         print(f"Total products scraped: {self.total_products}")
         print(f"Errors: {self.errors}")
@@ -711,6 +774,8 @@ def main():
                         help="Max jobs per company")
     parser.add_argument("--products-limit", type=int, default=10,
                         help="Max products per company")
+    parser.add_argument("--market-limit", type=int, default=50,
+                        help="Max articles per market news feed (0 = skip market feeds)")
     parser.add_argument("--delay", type=float, default=1.0,
                         help="Delay between requests (seconds)")
     parser.add_argument("--timeout", type=float, default=30.0,
@@ -753,6 +818,7 @@ def main():
         max_news_per_company=args.news_limit,
         max_jobs_per_company=args.jobs_limit,
         max_products_per_company=args.products_limit,
+        max_market_news=args.market_limit,
         delay=args.delay,
         timeout=args.timeout,
         proxies=proxies if proxies else None,
