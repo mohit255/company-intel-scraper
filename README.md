@@ -29,7 +29,7 @@ of companies (`companies.json`) and stores the results in PostgreSQL.
 
 - [Setup with Docker (recommended)](#setup-with-docker-recommended): Ubuntu server, step by step
 - [Docker cron jobs](#docker-cron-jobs): what runs when
-- [Daily operations](#daily-operations): health checks, updates, stopping a run
+- [Daily operations](#daily-operations): keeping it running, run history, health checks, updates
 - [Troubleshooting](#troubleshooting): every issue seen during setup, with the fix
 - [Local development on macOS](#local-development-on-macos-docker-desktop)
 - [Bare-metal setup (without Docker)](#bare-metal-setup-without-docker)
@@ -372,6 +372,90 @@ it stops runs piling up.
 
 ## Daily operations
 
+### Keeping it running
+
+There is **no long-running scraper container**. Cron starts a fresh
+container for each job, and `--rm` deletes it when the job ends. Keeping it
+running means keeping three host services up, all started on boot:
+
+```
+server boots → systemd starts docker, cron, postgresql
+            → cron fires on schedule → docker/cron.sh <job> → short-lived container → removed
+```
+
+```bash
+sudo systemctl enable --now docker cron postgresql   # start now and on every boot
+systemctl is-enabled docker cron postgresql          # each: enabled
+systemctl is-active  docker cron postgresql          # each: active
+crontab -l | grep cron.sh                            # 5 jobs in YOUR crontab (not root's)
+```
+
+| If this is down | What happens |
+|---|---|
+| `docker` | `cron.sh` logs `Cannot use Docker ...` and skips the job |
+| `cron` | nothing runs, and no new `[scrape] start` lines appear |
+| `postgresql` | `❌ DB connection FAILED ... Connection refused` |
+
+**Reboot test** (once, at a quiet time):
+
+```bash
+sudo reboot
+# after logging back in:
+systemctl is-active docker cron postgresql
+docker/cron.sh scrape &
+sleep 15; grep -E "DB connected|DB permissions" logs/cron-scrape.log | tail -2
+```
+
+**Disk space.** A full disk is the most common way this stops:
+
+```bash
+du -sh logs backups          # logs rotate after 7 days (Step 11), backups are deleted after 30
+docker image prune -f        # remove old images left behind by each `docker compose build`
+```
+
+### Where's the container? Seeing past runs
+
+`docker ps` only shows the scraper **while a job is running**: about 6–20
+minutes after each `HH:00`. At other times it's normal for `docker ps` to
+list only other apps (e.g. `company-intel-app-1`, `n8n`). The container
+is removed after each run, so `docker ps -a` doesn't show it either.
+**Nothing is lost**, because all its output is in `logs/cron-<job>.log`.
+
+```bash
+date
+grep -n "\[scrape\] \(start\|end\)" logs/cron-scrape.log | tail -6    # run history
+```
+
+| You see | Meaning |
+|---|---|
+| a `start` at the last `HH:00`, followed by `end ... rc=0` | Working. The container ran and was removed. |
+| a `start` at the last `HH:00` with no `end` yet | Running now; `docker ps` shows `company-intel-scrape` |
+| the last `start` is more than 1 hour old | Cron isn't firing: `crontab -l \| grep cron.sh`, `systemctl is-active cron` |
+| `end ... rc=1` | Failed; read the `❌` line just above it |
+
+Full output of the last run (what `docker logs` would have shown):
+
+```bash
+sed -n "$(grep -n '\[scrape\] start' logs/cron-scrape.log | tail -1 | cut -d: -f1),\$p" logs/cron-scrape.log | grep -v "❌ http\|✅ http"
+```
+
+Docker's own record of the containers it started and removed:
+
+```bash
+docker events --since 24h --until now --filter container=company-intel-scrape --filter event=start --filter event=die
+```
+
+Watch a run while it's happening (just after `HH:00`):
+
+```bash
+docker ps --format '{{.Names}}  {{.Status}}' | grep company-intel-
+docker logs -f --tail 50 company-intel-scrape
+```
+
+Containers aren't kept on purpose. The fixed name `company-intel-scrape` is
+the overlap lock, so a leftover stopped container would block every later run
+with "name already in use".
+
 ### Health checks
 
 | What | Command | Healthy |
@@ -441,6 +525,7 @@ they came up. Start with the first `❌` or error line in `logs/cron-<job>.log`.
 | 15 | `pg_dump: error: server version mismatch` | Host `pg_dump` older than the server | `sudo apt install -y postgresql-client-<server major>` |
 | 16 | Proxy files show up as directories | `proxies*.txt` didn't exist when the container first started | `rm -rf proxies*.txt && touch proxies.txt proxies_working.txt proxies_failed.txt` |
 | 17 | `.env` values ignored or wrong | Windows line endings, quotes, or comments after values | `sed -i 's/\r$//' .env`; follow the Step 4 formatting rules |
+| 18 | `docker ps` shows no scraper container / "the container is removed after execution" | Normal: each job's container exists only while it runs and is removed by `--rm` | Check run history in `logs/cron-scrape.log`, see [Where's the container?](#wheres-the-container-seeing-past-runs) |
 
 ---
 
